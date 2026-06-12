@@ -22,6 +22,26 @@
 #define USA_HAS_HW_BP 0
 #endif
 
+#include <linux/mm.h>
+#include <linux/mman.h>
+#include <linux/highmem.h>
+#include <linux/signal.h>
+#include <linux/sched/mm.h>
+
+/* 兼容旧内核 mmap_sem vs mmap_lock */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0)
+#define mmap_lock mmap_sem
+#define down_write_mmap(mm) down_write(&(mm)->mmap_sem)
+#define up_write_mmap(mm) up_write(&(mm)->mmap_sem)
+#define down_read_mmap(mm) down_read(&(mm)->mmap_sem)
+#define up_read_mmap(mm) up_read(&(mm)->mmap_sem)
+#else
+#define down_write_mmap(mm) down_write(&(mm)->mmap_lock)
+#define up_write_mmap(mm) up_write(&(mm)->mmap_lock)
+#define down_read_mmap(mm) down_read(&(mm)->mmap_lock)
+#define up_read_mmap(mm) up_read(&(mm)->mmap_lock)
+#endif
+
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
@@ -201,7 +221,12 @@ static DEFINE_SPINLOCK(bp_lock);
 
 typedef unsigned long (*vm_mmap_t)(struct file *, unsigned long, unsigned long,
                                    unsigned long, unsigned long, unsigned long);
+/* kernel_siginfo 在 5.4+ 才有, 旧内核用 siginfo_t */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
 typedef int (*send_sig_info_t)(int, struct kernel_siginfo *, struct task_struct *, enum pid_type);
+#else
+typedef int (*send_sig_info_t)(int, struct siginfo *, struct task_struct *, int);
+#endif
 
 static vm_mmap_t fn_vm_mmap = NULL;
 static send_sig_info_t fn_send_sig = NULL;
@@ -314,20 +339,8 @@ static int usa_inject_so(INJECT_REQUEST *req)
         /* 发送信号触发执行 (用 SIGUSR2, 设 handler 为 shellcode) */
         /* 简化方案: 直接修改目标线程的 PC 到 shellcode (更可靠) */
         /* 通过修改信号帧: 发送一个信号并设置 sa_handler = remote_page */
-        struct kernel_siginfo info;
-        clear_siginfo(&info);
-        info.si_signo = SIGUSR2;
-        info.si_code = SI_QUEUE;
-        info.si_pid = current->tgid;
-
-        /* 设置目标进程的 SIGUSR2 handler 为 shellcode 地址 */
-        /* 注: 这需要从内核态修改用户态信号表, 比较危险 */
-        /* 更安全的方法: 用 force_sig_fault 或直接修改 pt_regs */
-
-        /* 最简单方案: 通过写目标进程内存来设置 */
-        /* 在 shellcode 末尾加 sigreturn 返回 */
-        if (fn_send_sig)
-            fn_send_sig(SIGUSR2, &info, task, PIDTYPE_PID);
+        /* 注入完成, shellcode 地址返回给用户态 */
+        /* 用户态通过信号或其他方式触发执行 */
     }
 
     put_task_struct(task);
@@ -360,7 +373,7 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
     mm = task->mm;
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    down_write(&mm->mmap_lock);
+    down_write_mmap(mm);
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (vma->vm_file) {
             char buf[256];
@@ -374,7 +387,7 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
             }
         }
     }
-    up_write(&mm->mmap_lock);
+    up_write_mmap(mm);
 
     put_task_struct(task);
     return 0;
@@ -427,7 +440,7 @@ static int usa_read_phys(pid_t target_pid, uintptr_t vaddr, void __user *ubuf, s
     mm = task->mm;
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    down_read(&mm->mmap_lock);
+    down_read_mmap(mm);
 
     /* ARM64 页表遍历 */
     pgd = pgd_offset(mm, vaddr);
@@ -458,7 +471,7 @@ static int usa_read_phys(pid_t target_pid, uintptr_t vaddr, void __user *ubuf, s
     }
 
 out:
-    up_read(&mm->mmap_lock);
+    up_read_mmap(mm);
     put_task_struct(task);
     return ret;
 }
