@@ -1,8 +1,10 @@
 /**
- * USA Kernel Driver — Hook Edition v8
+ * USA Kernel Driver v14 — SKJH 架构复刻
  *
- * hook getpid + aarch64_insn_patch_text_nosync 写 sys_call_table
- * v8: 加入硬件断点/看门狗 (hardware watchpoint) 支持
+ * 通信: kprobe pre_handler on __arm64_sys_getpid + PID 过滤
+ * 读写: 页表遍历 (无锁, 原子上下文安全)
+ * 注入: UXN Shoot (页表陷阱 + HW 执行断点 + 栈改写)
+ * 隐藏: 模块摘除 + kprobe 摘除
  */
 
 #include <linux/module.h>
@@ -10,97 +12,42 @@
 #include <linux/kprobes.h>
 #include <linux/version.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
 #include <linux/list.h>
-#include <linux/uaccess.h>
-#include <asm/unistd.h>
-
-#ifdef CONFIG_HAVE_HW_BREAKPOINT
+#include <linux/mm.h>
+#include <linux/highmem.h>
+#include <linux/pid.h>
+#include <linux/proc_fs.h>
+#include <linux/pgtable.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
-#define USA_HAS_HW_BP 1
-#else
-#define USA_HAS_HW_BP 0
-#endif
-
-#include <linux/mm.h>
-#include <linux/mman.h>
-#include <linux/highmem.h>
 #include <linux/signal.h>
-#include <linux/sched/mm.h>
-
-/* 兼容旧内核 mmap_sem vs mmap_lock */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0)
-#define mmap_lock mmap_sem
-#define down_write_mmap(mm) down_write(&(mm)->mmap_sem)
-#define up_write_mmap(mm) up_write(&(mm)->mmap_sem)
-#define down_read_mmap(mm) down_read(&(mm)->mmap_sem)
-#define up_read_mmap(mm) up_read(&(mm)->mmap_sem)
-#else
-#define down_write_mmap(mm) down_write(&(mm)->mmap_lock)
-#define up_write_mmap(mm) up_write(&(mm)->mmap_lock)
-#define down_read_mmap(mm) down_read(&(mm)->mmap_lock)
-#define up_read_mmap(mm) up_read(&(mm)->mmap_lock)
-#endif
+#include <asm/unistd.h>
+#include <asm/tlbflush.h>
 
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 
-/* #3 Syscall 轮转: hook getpid + gettid + getppid */
-#define USA_HOOK_NR0 __NR_getpid
-#define USA_HOOK_NR1 __NR_gettid
-#define USA_HOOK_NR2 __NR_getppid
-
-/* #5 MAGIC 随机化: 启动时生成, 写入文件给用户态读 */
-#define USA_MAGIC_PATH "/data/local/tmp/.gs_m"
-static unsigned long usa_magic = 0x55534100; /* 默认值, 运行时会被随机替换 */
-
-static void usa_randomize_magic(void)
-{
-    unsigned long rand_val;
-    get_random_bytes(&rand_val, sizeof(rand_val));
-    /* 保留高 8 bits 为 0x55 作为签名, 低 24 bits 随机 */
-    usa_magic = 0x55000000UL | (rand_val & 0x00FFFFFFUL);
-}
-
-/* 前向声明 */
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-static kallsyms_lookup_name_t kln_func;
-
-/* filp_open/kernel_write 在 GKI 内核不导出
- * 改用 kallsyms 解析, 失败则跳过 (用默认 MAGIC) */
-typedef struct file *(*filp_open_t)(const char *, int, umode_t);
-typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
-
-static void usa_write_magic_file(void)
-{
-    filp_open_t fn_filp_open;
-    kernel_write_t fn_kernel_write;
-    struct file *f;
-    char buf[32];
-    int len;
-    loff_t pos = 0;
-
-    if (!kln_func) return;
-    fn_filp_open = (filp_open_t)kln_func("filp_open");
-    fn_kernel_write = (kernel_write_t)kln_func("kernel_write");
-    if (!fn_filp_open || !fn_kernel_write) return;
-
-    len = snprintf(buf, sizeof(buf), "%lx", usa_magic);
-    f = fn_filp_open(USA_MAGIC_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (!IS_ERR(f)) {
-        fn_kernel_write(f, buf, len, &pos);
-        filp_close(f, NULL);
-    }
-}
-
 MODULE_LICENSE("GPL");
 
 /* =====================================================================
- * kallsyms (kprobe)
+ * 模块参数
  * ===================================================================== */
 
-/* kln_func 已在前面声明 */
+static int comm_pid = -1;
+module_param(comm_pid, int, 0);
+
+static unsigned long usa_magic = 0x55534100;
+module_param(usa_magic, ulong, 0);
+
+/* =====================================================================
+ * kallsyms 解析
+ * ===================================================================== */
+
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t kln_func;
 
 static int resolve_kallsyms(void)
 {
@@ -113,362 +60,320 @@ static int resolve_kallsyms(void)
 }
 
 /* =====================================================================
- * #6 kprobe-based syscall hook (不修改 sys_call_table)
+ * 共享页 — kprobe handler 通过 kernel VA 直接访问
  *
- * 原理: 在 __arm64_sys_getpid 等函数入口注册 kprobe
- *        pre_handler 检查 MAGIC, 命中则处理命令并修改 PC 跳过原函数
- *        sys_call_table 完全不动, 完整性校验通过
- *
- * 隐匿: 注册后从 kprobe 内部链表摘除, debugfs 不可见
+ * 布局 (4096 bytes):
+ *   [0]   u32 state    0=idle 1=pending 2=done
+ *   [4]   u32 magic
+ *   [8]   u32 cmd
+ *   [12]  i32 pid
+ *   [16]  u64 addr
+ *   [24]  u64 size
+ *   [32]  i64 result
+ *   [40]  u8  name[256]
+ *   [296] u8  data[3800]
  * ===================================================================== */
 
-static void __maybe_unused *orig_getpid = NULL;
+#define SHM_STATE_IDLE    0
+#define SHM_STATE_PENDING 1
+#define SHM_STATE_DONE    2
 
-/* 前向声明 */
-static long usa_hooked_getpid(const struct pt_regs *regs);
-
-/* ====== kretprobe: 在 syscall 返回时拦截 ======
- *
- * pre_handler: 检查 MAGIC, 命中则处理命令, 把结果存到 data
- * ret_handler: 用存的结果覆盖返回值
- *
- * 优点: 不需要跳过原函数, ARM64 完全兼容
- */
-
-struct usa_kret_data {
-    long result;
-    int handled;
+struct usa_shm {
+    volatile uint32_t state;
+    uint32_t magic;
+    uint32_t cmd;
+    int32_t  pid;
+    uint64_t addr;
+    uint64_t size;
+    int64_t  result;
+    char     name[256];
+    uint8_t  data[3800];
 };
 
-static int kret_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static struct page *shm_page;
+static struct usa_shm *shm;
+
+/* /proc mmap */
+static vm_fault_t usa_vm_fault(struct vm_fault *vmf)
 {
-    struct usa_kret_data *data = (struct usa_kret_data *)ri->data;
-    struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
-    unsigned long magic;
-
-    data->handled = 0;
-
-    if (!user_regs)
-        return 0;
-
-    if (copy_from_user(&magic, &user_regs->regs[0], sizeof(magic)))
-        return 0;
-
-    if (magic != usa_magic)
-        return 0;
-
-    /* 是我们的命令 */
-    data->result = usa_hooked_getpid(user_regs);
-    data->handled = 1;
+    get_page(shm_page);
+    vmf->page = shm_page;
     return 0;
 }
 
-static int kret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+static const struct vm_operations_struct usa_vm_ops = {
+    .fault = usa_vm_fault,
+};
+
+static int usa_proc_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    struct usa_kret_data *data = (struct usa_kret_data *)ri->data;
-    if (data->handled) {
-        /* 覆盖返回值 */
-        regs->regs[0] = data->result;
-    }
+    if (vma->vm_end - vma->vm_start != PAGE_SIZE)
+        return -EINVAL;
+    vma->vm_ops = &usa_vm_ops;
     return 0;
 }
 
-static struct kretprobe krp_getpid = {
-    .kp.symbol_name = "__arm64_sys_getpid",
-    .handler = kret_handler,
-    .entry_handler = kret_entry,
-    .data_size = sizeof(struct usa_kret_data),
-    .maxactive = 20,
+static const struct proc_ops usa_proc_ops = {
+    .proc_mmap = usa_proc_mmap,
 };
 
-static struct kretprobe krp_gettid = {
-    .kp.symbol_name = "__arm64_sys_gettid",
-    .handler = kret_handler,
-    .entry_handler = kret_entry,
-    .data_size = sizeof(struct usa_kret_data),
-    .maxactive = 20,
-};
-
-static struct kretprobe krp_getppid = {
-    .kp.symbol_name = "__arm64_sys_getppid",
-    .handler = kret_handler,
-    .entry_handler = kret_entry,
-    .data_size = sizeof(struct usa_kret_data),
-    .maxactive = 20,
-};
-
-/* 从 kprobe 内部链表摘除 */
-static void hide_kretprobe(struct kretprobe *rp)
-{
-    if (rp->kp.hlist.pprev) {
-        hlist_del_rcu(&rp->kp.hlist);
-        rp->kp.hlist.pprev = NULL;
-    }
-}
+static struct proc_dir_entry *usa_proc_entry;
 
 /* =====================================================================
- * 硬件断点 (Hardware Watchpoint) — 条件编译
+ * Shoot 注入系统 — UXN 页表陷阱 + HW 执行断点
  * ===================================================================== */
 
-#if USA_HAS_HW_BP
-
-typedef struct perf_event *(*register_user_hw_breakpoint_t)(
-    struct perf_event_attr *attr,
-    perf_overflow_handler_t triggered,
-    void *context,
-    struct task_struct *tsk);
-typedef void (*unregister_hw_breakpoint_t)(struct perf_event *bp);
-typedef struct task_struct *(*find_task_by_vpid_t)(pid_t pid);
-
-static register_user_hw_breakpoint_t  fn_register_user_hw_bp  = NULL;
-static unregister_hw_breakpoint_t     fn_unregister_hw_bp     = NULL;
-static find_task_by_vpid_t            fn_find_task_by_vpid    = NULL;
-
-static struct perf_event *usa_bp_event[USA_MAX_HW_BP] = {NULL};
-
-static struct {
-    int hit;
-    uintptr_t hit_addr;
-    uintptr_t hit_pc;
-    unsigned long regs[31];
-    int hit_count;
-} usa_bp_state[USA_MAX_HW_BP];
-
-static DEFINE_SPINLOCK(bp_lock);
-
-static void usa_bp_handler(struct perf_event *bp,
-                           struct perf_sample_data *data,
-                           struct pt_regs *regs)
-{
-    int i;
-    unsigned long flags;
-    spin_lock_irqsave(&bp_lock, flags);
-    for (i = 0; i < USA_MAX_HW_BP; i++) {
-        if (usa_bp_event[i] == bp) {
-            usa_bp_state[i].hit = 1;
-            usa_bp_state[i].hit_pc = regs->pc;
-            usa_bp_state[i].hit_addr = bp->attr.bp_addr;
-            usa_bp_state[i].hit_count++;
-            memcpy(usa_bp_state[i].regs, regs->regs, sizeof(unsigned long) * 31);
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&bp_lock, flags);
-}
-
-static int resolve_hw_bp_symbols(void)
-{
-    if (!kln_func) return -EFAULT;
-    fn_register_user_hw_bp = (register_user_hw_breakpoint_t)kln_func("register_user_hw_breakpoint");
-    fn_unregister_hw_bp = (unregister_hw_breakpoint_t)kln_func("unregister_hw_breakpoint");
-    fn_find_task_by_vpid = (find_task_by_vpid_t)kln_func("find_task_by_vpid");
-    return (fn_register_user_hw_bp && fn_unregister_hw_bp && fn_find_task_by_vpid) ? 0 : -ENOENT;
-}
-
-static int usa_set_hw_bp(HW_BP_REQUEST *req)
-{
-    struct perf_event_attr attr;
-    struct task_struct *task;
-    struct perf_event *bp;
-    int idx = req->index;
-    if (idx < 0 || idx >= USA_MAX_HW_BP) return -EINVAL;
-    if (!fn_register_user_hw_bp || !fn_find_task_by_vpid) return -ENOENT;
-    if (usa_bp_event[idx]) { fn_unregister_hw_bp(usa_bp_event[idx]); usa_bp_event[idx] = NULL; }
-    rcu_read_lock();
-    task = fn_find_task_by_vpid(req->pid);
-    if (task) get_task_struct(task);
-    rcu_read_unlock();
-    if (!task) return -ESRCH;
-    hw_breakpoint_init(&attr);
-    attr.bp_addr = req->addr;
-    switch (req->len) {
-    case 1: attr.bp_len = HW_BREAKPOINT_LEN_1; break;
-    case 2: attr.bp_len = HW_BREAKPOINT_LEN_2; break;
-    case 4: attr.bp_len = HW_BREAKPOINT_LEN_4; break;
-    case 8: attr.bp_len = HW_BREAKPOINT_LEN_8; break;
-    default: attr.bp_len = HW_BREAKPOINT_LEN_4; break;
-    }
-    switch (req->type) {
-    case USA_HW_BP_READ:  attr.bp_type = HW_BREAKPOINT_R; break;
-    case USA_HW_BP_WRITE: attr.bp_type = HW_BREAKPOINT_W; break;
-    case USA_HW_BP_RW:    attr.bp_type = HW_BREAKPOINT_RW; break;
-    default: attr.bp_type = HW_BREAKPOINT_W; break;
-    }
-    bp = fn_register_user_hw_bp(&attr, usa_bp_handler, NULL, task);
-    put_task_struct(task);
-    if (IS_ERR(bp)) return PTR_ERR(bp);
-    usa_bp_event[idx] = bp;
-    memset(&usa_bp_state[idx], 0, sizeof(usa_bp_state[idx]));
-    return 0;
-}
-
-static void usa_clear_hw_bp(int idx)
-{
-    if (idx < 0 || idx >= USA_MAX_HW_BP) return;
-    if (usa_bp_event[idx]) { fn_unregister_hw_bp(usa_bp_event[idx]); usa_bp_event[idx] = NULL; memset(&usa_bp_state[idx], 0, sizeof(usa_bp_state[idx])); }
-}
-
-static void usa_clear_all_bp(void) { int i; for (i = 0; i < USA_MAX_HW_BP; i++) usa_clear_hw_bp(i); }
-
-#else /* !USA_HAS_HW_BP */
-
-static int resolve_hw_bp_symbols(void) { return -ENOENT; }
-static int usa_set_hw_bp(HW_BP_REQUEST *req) { return -ENOSYS; }
-static void usa_clear_hw_bp(int idx) { }
-static void usa_clear_all_bp(void) { }
-
-/* 空的 bp_state 用于 GET_BP_INFO */
-static struct { int hit; uintptr_t hit_addr; uintptr_t hit_pc; unsigned long regs[31]; int hit_count; } usa_bp_state[USA_MAX_HW_BP];
-static DEFINE_SPINLOCK(bp_lock);
-
-#endif /* USA_HAS_HW_BP */
-
-/* =====================================================================
- * 内核级 SO 注入 (无 ptrace, 无 TracerPid 痕迹)
- *
- * 原理: 在目标进程分配内存, 写入 dlopen shellcode,
- *        用信号触发执行
- * ===================================================================== */
+typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
+static find_task_by_vpid_t fn_find_task_by_vpid;
 
 typedef unsigned long (*vm_mmap_t)(struct file *, unsigned long, unsigned long,
                                    unsigned long, unsigned long, unsigned long);
-/* kernel_siginfo 在 5.4+ 才有, 旧内核用 siginfo_t */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
-typedef int (*send_sig_info_t)(int, struct kernel_siginfo *, struct task_struct *, enum pid_type);
-#else
-typedef int (*send_sig_info_t)(int, struct siginfo *, struct task_struct *, int);
-#endif
+static vm_mmap_t fn_vm_mmap;
 
-static vm_mmap_t fn_vm_mmap = NULL;
-static send_sig_info_t fn_send_sig = NULL;
+typedef void (*use_mm_fn_t)(struct mm_struct *);
+static use_mm_fn_t fn_use_mm;
+static use_mm_fn_t fn_unuse_mm;
 
-static int resolve_inject_symbols(void)
+typedef void (*flush_tlb_page_fn_t)(struct vm_area_struct *, unsigned long);
+static flush_tlb_page_fn_t fn_flush_tlb_page;
+
+static int resolve_symbols(void)
 {
     if (!kln_func) return -EFAULT;
+    fn_find_task_by_vpid = (find_task_by_vpid_t)kln_func("find_task_by_vpid");
     fn_vm_mmap = (vm_mmap_t)kln_func("vm_mmap");
-    fn_send_sig = (send_sig_info_t)kln_func("send_sig_info");
-    if (!fn_find_task_by_vpid)
-        fn_find_task_by_vpid = (find_task_by_vpid_t)kln_func("find_task_by_vpid");
-    return (fn_vm_mmap && fn_find_task_by_vpid) ? 0 : -ENOENT;
+    fn_use_mm = (use_mm_fn_t)kln_func("kthread_use_mm");
+    fn_unuse_mm = (use_mm_fn_t)kln_func("kthread_unuse_mm");
+    if (!fn_use_mm) fn_use_mm = (use_mm_fn_t)kln_func("use_mm");
+    if (!fn_unuse_mm) fn_unuse_mm = (use_mm_fn_t)kln_func("unuse_mm");
+    fn_flush_tlb_page = (flush_tlb_page_fn_t)kln_func("flush_tlb_page");
+    return fn_find_task_by_vpid ? 0 : -ENOENT;
+}
+
+/* 获取用户页 PTE 指针 */
+static pte_t *get_user_ptep(struct mm_struct *mm, unsigned long addr)
+{
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+
+    pgd = pgd_offset(mm, addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
+
+    p4d = p4d_offset(pgd, addr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
+
+    pud = pud_offset(p4d, addr);
+    if (pud_none(*pud) || pud_bad(*pud)) return NULL;
+
+    pmd = pmd_offset(pud, addr);
+    if (pmd_none(*pmd) || pmd_bad(*pmd)) return NULL;
+
+    return pte_offset_kernel(pmd, addr);
+}
+
+/* ARM64 PTE UXN (User eXecute Never) 位操作 */
+#define PTE_UXN_BIT  (1ULL << 54)
+
+static void set_pte_uxn(pte_t *ptep, unsigned long addr, struct mm_struct *mm)
+{
+    pte_t pte = READ_ONCE(*ptep);
+    pte_t new_pte = __pte(pte_val(pte) | PTE_UXN_BIT);
+    set_pte(ptep, new_pte);
+    /* flush TLB for this page */
+    __flush_tlb_kernel_pgtable(addr);
+}
+
+static void clear_pte_uxn(pte_t *ptep, unsigned long addr, struct mm_struct *mm)
+{
+    pte_t pte = READ_ONCE(*ptep);
+    pte_t new_pte = __pte(pte_val(pte) & ~PTE_UXN_BIT);
+    set_pte(ptep, new_pte);
+    __flush_tlb_kernel_pgtable(addr);
 }
 
 /*
- * ARM64 dlopen shellcode (PIC):
- *   STP X29, X30, [SP, #-16]!
- *   MOV X29, SP
- *   ADR X0, path          // X0 = &so_path (PC-relative)
- *   MOV X1, #2            // RTLD_NOW
- *   LDR X16, [X0, #-8]    // dlopen address stored before path
- *   BLR X16
- *   LDP X29, X30, [SP], #16
- *   RET
- *   .quad dlopen_addr      // -8 from path
- *   path: "/data/local/tmp/libusa_hook.so\0"
+ * dlopen shellcode (ARM64, PIC)
+ * Layout: [code 32B] [orig_pc 8B] [dlopen_addr 8B] [path NUL-term]
+ *
+ * STP X29, X30, [SP, #-16]!
+ * MOV X29, SP
+ * ADR X0, path            ; X0 = &path (PC-relative, offset +40 from here)
+ * MOV X1, #2              ; RTLD_NOW
+ * LDR X16, [X0, #-8]      ; dlopen_addr (at path-8)
+ * BLR X16                 ; dlopen(path, 2)
+ * LDP X29, X30, [SP], #16
+ * LDR X16, [X0, #-16]     ; orig_pc (at path-16)
+ * BR  X16                 ; jump back to original PC
  */
-static const uint32_t inject_shellcode[] = {
+static const uint32_t shoot_shellcode[] = {
     0xA9BF7BFD, /* STP X29, X30, [SP, #-16]! */
     0x910003FD, /* MOV X29, SP */
-    0x100000A0, /* ADR X0, path (PC+20) */
-    0xD2800041, /* MOV X1, #2 (RTLD_NOW) */
-    0xF85F8010, /* LDUR X16, [X0, #-8] */
+    0x10000140, /* ADR X0, #40  (→ path at code+48) */
+    0xD2800041, /* MOV X1, #2   (RTLD_NOW) */
+    0xF85F8010, /* LDUR X16, [X0, #-8]  → dlopen_addr */
     0xD63F0200, /* BLR X16 */
     0xA8C17BFD, /* LDP X29, X30, [SP], #16 */
-    0xD65F03C0, /* RET */
+    0xF8500010, /* LDUR X16, [X0, #-16] → orig_pc */
+    0xD61F0200, /* BR X16 */
 };
-#define SHELLCODE_SIZE (sizeof(inject_shellcode))
-#define SHELLCODE_PATH_OFF (SHELLCODE_SIZE + 8) /* 8 = dlopen addr */
+/* code: 36 bytes (9 insns), pad to 32 aligned: use 36 */
+#define SHOOT_CODE_SIZE  36
+/* [36] orig_pc 8B, [44] dlopen_addr 8B, [52] path string */
+#define SHOOT_ORIGPC_OFF 36
+#define SHOOT_DLOPEN_OFF 44
+#define SHOOT_PATH_OFF   52
 
-static int usa_inject_so(INJECT_REQUEST *req)
+/* Shoot 状态 */
+static struct {
+    int active;
+    pid_t target_pid;
+    unsigned long trap_addr;
+    pte_t *trap_ptep;
+    struct mm_struct *trap_mm;
+    unsigned long remote_page;
+    struct perf_event *bp_event;
+} shoot_state;
+
+static DEFINE_SPINLOCK(shoot_lock);
+
+/* HW 执行断点 handler — 游戏线程命中 UXN 陷阱后触发 */
+static void shoot_bp_handler(struct perf_event *bp,
+                             struct perf_sample_data *data,
+                             struct pt_regs *regs)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&shoot_lock, flags);
+    if (!shoot_state.active) {
+        spin_unlock_irqrestore(&shoot_lock, flags);
+        return;
+    }
+
+    /* 改线程 PC 到 shellcode */
+    regs->pc = shoot_state.remote_page;
+
+    /* 恢复页面可执行 */
+    if (shoot_state.trap_ptep)
+        clear_pte_uxn(shoot_state.trap_ptep, shoot_state.trap_addr, shoot_state.trap_mm);
+
+    shoot_state.active = 0;
+    spin_unlock_irqrestore(&shoot_lock, flags);
+}
+
+/* 执行 Shoot 注入 */
+static int usa_shoot_inject(int target_pid, const char *so_path, unsigned long dlopen_addr)
 {
     struct task_struct *task;
     struct mm_struct *mm;
     unsigned long remote_page;
-    char so_path[256] = {0};
-    unsigned long dlopen_addr = 0;
-    int ret = 0;
+    unsigned long code_addr;
+    unsigned char buf[512];
+    size_t total_size;
+    pte_t *ptep;
+    struct perf_event_attr attr;
+    struct perf_event *bp;
 
-    if (!fn_vm_mmap || !fn_find_task_by_vpid)
-        return -ENOENT;
+    if (!fn_find_task_by_vpid || !fn_vm_mmap) return -ENOENT;
+    if (!dlopen_addr) return -EINVAL;
 
-    if (copy_from_user(so_path, (void __user *)req->so_path, sizeof(so_path) - 1))
-        return -EFAULT;
-
-    /* 找目标进程 */
     rcu_read_lock();
-    task = fn_find_task_by_vpid(req->pid);
+    task = fn_find_task_by_vpid(target_pid);
     if (task) get_task_struct(task);
     rcu_read_unlock();
     if (!task) return -ESRCH;
 
-    /* 找 dlopen 地址: 从目标进程的 linker 符号 */
-    /* 简化: 用本进程的 dlopen 偏移 + 目标进程的 linker 基址 */
-    dlopen_addr = get_module_base(req->pid, "linker64");
-    if (dlopen_addr == 0) {
-        /* 回退: 读目标进程的 /proc/pid/maps 找 libdl.so */
-        dlopen_addr = get_module_base(req->pid, "libdl.so");
-    }
-
-    /* 在目标进程的上下文中 mmap */
     mm = task->mm;
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    /* 切换到目标 mm */
-    {
-        struct mm_struct *old_mm;
-        unsigned long page_size = 4096;
-        size_t total_size = SHELLCODE_PATH_OFF + strlen(so_path) + 1;
-        unsigned char buf[512];
-
-        /* 分配远程内存 */
-        old_mm = current->mm;
-        current->mm = mm;
-        remote_page = fn_vm_mmap(NULL, 0, page_size,
+    /* 在目标进程分配 RWX 内存 */
+    if (fn_use_mm && fn_unuse_mm) {
+        mmget(mm);
+        fn_use_mm(mm);
+        remote_page = fn_vm_mmap(NULL, 0, 4096,
                                   PROT_READ | PROT_WRITE | PROT_EXEC,
                                   MAP_PRIVATE | MAP_ANONYMOUS, 0);
-        current->mm = old_mm;
-
-        if (IS_ERR_VALUE(remote_page)) {
-            put_task_struct(task);
-            return -ENOMEM;
-        }
-
-        /* 构建 shellcode 缓冲 */
-        memset(buf, 0, sizeof(buf));
-        memcpy(buf, inject_shellcode, SHELLCODE_SIZE);
-        /* dlopen 地址放在 shellcode 后面 (path 前面 8 字节) */
-        *(unsigned long *)(buf + SHELLCODE_SIZE) = dlopen_addr;
-        /* so 路径 */
-        memcpy(buf + SHELLCODE_PATH_OFF, so_path, strlen(so_path) + 1);
-
-        /* 写入目标进程 */
-        if (!write_process_memory(req->pid, remote_page, buf, total_size)) {
-            ret = -EIO;
-        }
+        fn_unuse_mm(mm);
+        mmput(mm);
+    } else {
+        put_task_struct(task);
+        return -ENOSYS;
     }
 
-    if (ret == 0) {
-        /* 发送信号触发执行 (用 SIGUSR2, 设 handler 为 shellcode) */
-        /* 简化方案: 直接修改目标线程的 PC 到 shellcode (更可靠) */
-        /* 通过修改信号帧: 发送一个信号并设置 sa_handler = remote_page */
-        /* 注入完成, shellcode 地址返回给用户态 */
-        /* 用户态通过信号或其他方式触发执行 */
+    if (IS_ERR_VALUE(remote_page)) {
+        put_task_struct(task);
+        return -ENOMEM;
     }
+
+    /* 找游戏代码页 (linker64 的 r-xp 页) 用于设置 UXN 陷阱 */
+    code_addr = get_module_base(target_pid, "libUE4.so");
+    if (!code_addr) code_addr = get_module_base(target_pid, "linker64");
+    if (!code_addr) {
+        put_task_struct(task);
+        return -ENODATA;
+    }
+    /* 用代码段的第一页 + 一些偏移确保是热路径 */
+    code_addr += 0x1000;
+
+    /* 构建 shellcode */
+    total_size = SHOOT_PATH_OFF + strlen(so_path) + 1;
+    memset(buf, 0, sizeof(buf));
+    memcpy(buf, shoot_shellcode, SHOOT_CODE_SIZE);
+    /* orig_pc: shellcode 执行完跳回的地址 = code_addr (被陷阱的地址) */
+    *(unsigned long *)(buf + SHOOT_ORIGPC_OFF) = code_addr;
+    *(unsigned long *)(buf + SHOOT_DLOPEN_OFF) = dlopen_addr;
+    memcpy(buf + SHOOT_PATH_OFF, so_path, strlen(so_path) + 1);
+
+    /* 写入目标进程 */
+    if (!write_process_memory(target_pid, remote_page, buf, total_size)) {
+        put_task_struct(task);
+        return -EIO;
+    }
+
+    /* 获取目标代码页 PTE */
+    ptep = get_user_ptep(mm, code_addr);
+    if (!ptep) {
+        put_task_struct(task);
+        return -EFAULT;
+    }
+
+    /* 设置 HW 执行断点 */
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = code_addr;
+    attr.bp_len = HW_BREAKPOINT_LEN_4;
+    attr.bp_type = HW_BREAKPOINT_X;
+
+    bp = register_perf_hw_breakpoint(&attr, shoot_bp_handler, NULL, task);
+    if (IS_ERR(bp)) {
+        /* 回退: 不用 HW BP, 直接用 UXN + 修改 thread PC */
+        /* 简化方案: 直接找一个睡眠线程改它的 PC */
+        put_task_struct(task);
+        return PTR_ERR(bp);
+    }
+
+    /* 记录 Shoot 状态 */
+    spin_lock_irq(&shoot_lock);
+    shoot_state.active = 1;
+    shoot_state.target_pid = target_pid;
+    shoot_state.trap_addr = code_addr;
+    shoot_state.trap_ptep = ptep;
+    shoot_state.trap_mm = mm;
+    shoot_state.remote_page = remote_page;
+    shoot_state.bp_event = bp;
+    spin_unlock_irq(&shoot_lock);
+
+    /* 设置 UXN 陷阱 — 游戏线程执行到这页就会触发 */
+    set_pte_uxn(ptep, code_addr, mm);
 
     put_task_struct(task);
-
-    /* 返回 shellcode 地址给用户态, 让用户态来设置信号 */
-    req->result = (int)(remote_page & 0xFFFFFFFF);
-    if (copy_to_user((void __user *)((unsigned long)req - 0), req, sizeof(*req)))
-        return -EFAULT;
-
-    return ret;
+    return 0;
 }
 
 /* =====================================================================
- * 隐匿性增强
+ * Maps 隐藏
  * ===================================================================== */
 
-/* #1 隐藏目标进程 maps 中指定 .so 的 VMA 条目 */
 static int usa_hide_maps(pid_t target_pid, const char *lib_name)
 {
     struct task_struct *task;
@@ -476,8 +381,9 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
     struct vm_area_struct *vma;
     unsigned long addr;
 
+    if (!fn_find_task_by_vpid) return -ENOENT;
     rcu_read_lock();
-    task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
+    task = fn_find_task_by_vpid(target_pid);
     if (task) get_task_struct(task);
     rcu_read_unlock();
     if (!task) return -ESRCH;
@@ -485,237 +391,117 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
     mm = task->mm;
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    down_write_mmap(mm);
-    /* 兼容新旧内核: 用 find_vma 遍历而不是 vm_next (6.1+ 没有 vm_next) */
     addr = 0;
     while ((vma = find_vma(mm, addr)) != NULL) {
         addr = vma->vm_end;
         if (vma->vm_file) {
-            char buf[256];
-            char *path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
+            char pathbuf[256];
+            char *path = d_path(&vma->vm_file->f_path, pathbuf, sizeof(pathbuf));
             if (!IS_ERR(path) && strstr(path, lib_name)) {
                 fput(vma->vm_file);
                 vma->vm_file = NULL;
             }
         }
     }
-    up_write_mmap(mm);
 
     put_task_struct(task);
     return 0;
-}
-
-/* #2 隐藏指定进程的 /proc 条目 */
-/* 通过从 pid namespace 的链表中移除 */
-static struct pid __maybe_unused *hidden_pid = NULL;
-
-static int usa_hide_process(pid_t target_pid)
-{
-    struct task_struct *task;
-
-    rcu_read_lock();
-    task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
-    if (task) get_task_struct(task);
-    rcu_read_unlock();
-    if (!task) return -ESRCH;
-
-    /* 从 /proc 的 pid_hash 中摘除 (ps/top 看不到) */
-    /* 进程本身还在运行, 只是 /proc 不可见 */
-    hidden_pid = task_pid(task);
-    /* 保存 hash chain 用于恢复 */
-
-    put_task_struct(task);
-    return 0;
-}
-
-/* #5 直接页表读写 (绕过 access_process_vm 内核 API 痕迹) */
-static int __maybe_unused usa_read_phys(pid_t target_pid, uintptr_t vaddr, void __user *ubuf, size_t size)
-{
-    struct task_struct *task;
-    struct mm_struct *mm;
-    pgd_t *pgd;
-    p4d_t *p4d;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
-    unsigned long pfn;
-    void *kaddr;
-    int ret = 0;
-
-    rcu_read_lock();
-    task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
-    if (task) get_task_struct(task);
-    rcu_read_unlock();
-    if (!task) return -ESRCH;
-
-    mm = task->mm;
-    if (!mm) { put_task_struct(task); return -EINVAL; }
-
-    down_read_mmap(mm);
-
-    /* ARM64 页表遍历 */
-    pgd = pgd_offset(mm, vaddr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) { ret = -EFAULT; goto out; }
-
-    p4d = p4d_offset(pgd, vaddr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) { ret = -EFAULT; goto out; }
-
-    pud = pud_offset(p4d, vaddr);
-    if (pud_none(*pud) || pud_bad(*pud)) { ret = -EFAULT; goto out; }
-
-    pmd = pmd_offset(pud, vaddr);
-    if (pmd_none(*pmd) || pmd_bad(*pmd)) { ret = -EFAULT; goto out; }
-
-    pte = pte_offset_kernel(pmd, vaddr);
-    if (!pte || !pte_present(*pte)) { ret = -EFAULT; goto out; }
-
-    pfn = pte_pfn(*pte);
-    kaddr = kmap_atomic(pfn_to_page(pfn));
-    if (kaddr) {
-        unsigned long page_off = vaddr & ~PAGE_MASK;
-        size_t copy_len = min(size, (size_t)(PAGE_SIZE - page_off));
-        if (copy_to_user(ubuf, kaddr + page_off, copy_len))
-            ret = -EFAULT;
-        kunmap_atomic(kaddr);
-    } else {
-        ret = -EFAULT;
-    }
-
-out:
-    up_read_mmap(mm);
-    put_task_struct(task);
-    return ret;
 }
 
 /* =====================================================================
- * Hook getpid 处理
+ * kprobe 命令处理 — 在 pre_handler 原子上下文执行
+ * 所有操作必须无锁 (页表遍历, RCU, kmap_atomic)
  * ===================================================================== */
 
-typedef long (*syscall_fn_t)(const struct pt_regs *);
-
-static long usa_hooked_getpid(const struct pt_regs *regs)
+static void process_command(void)
 {
-    unsigned long magic = regs->regs[0];
-    unsigned long cmd   = regs->regs[1];
-    unsigned long arg   = regs->regs[2];
-
-    COPY_MEMORY cm;
-    MODULE_BASE mb;
-    HW_BP_REQUEST bp_req;
-    HW_BP_HIT bp_hit;
-    char name[0x100] = {0};
-
-    if (magic != usa_magic)
-        return task_tgid_vnr(current);
+    uint32_t cmd = shm->cmd;
+    int32_t pid  = shm->pid;
+    uint64_t addr = shm->addr;
+    uint64_t size = shm->size;
 
     switch (cmd) {
     case OP_READ_MEM:
-        if (copy_from_user(&cm, (void __user *)arg, sizeof(cm)))
-            return -EFAULT;
-        if (!read_process_memory(cm.pid, cm.addr, cm.buffer, cm.size))
-            return -EIO;
-        return 0;
+        if (size > sizeof(shm->data)) size = sizeof(shm->data);
+        shm->result = read_process_memory(pid, addr, shm->data, size) ? 0 : -EIO;
+        break;
 
     case OP_WRITE_MEM:
-        if (copy_from_user(&cm, (void __user *)arg, sizeof(cm)))
-            return -EFAULT;
-        if (!write_process_memory(cm.pid, cm.addr, cm.buffer, cm.size))
-            return -EIO;
-        return 0;
+        if (size > sizeof(shm->data)) size = sizeof(shm->data);
+        shm->result = write_process_memory(pid, addr, shm->data, size) ? 0 : -EIO;
+        break;
 
     case OP_MODULE_BASE:
-        if (copy_from_user(&mb, (void __user *)arg, sizeof(mb)))
-            return -EFAULT;
-        if (copy_from_user(name, (void __user *)mb.name, sizeof(name) - 1))
-            return -EFAULT;
-        mb.base = get_module_base(mb.pid, name);
-        if (copy_to_user((void __user *)arg, &mb, sizeof(mb)))
-            return -EFAULT;
-        return 0;
+        shm->result = (int64_t)get_module_base(pid, shm->name);
+        break;
 
-    /* ===== 硬件断点 ===== */
+    case OP_INJECT_SO:
+        shm->result = usa_shoot_inject(pid, shm->name, (unsigned long)addr);
+        break;
 
-    case OP_SET_HW_BP:
-        if (copy_from_user(&bp_req, (void __user *)arg, sizeof(bp_req)))
-            return -EFAULT;
-        return usa_set_hw_bp(&bp_req);
-
-    case OP_CLEAR_HW_BP:
-        if (copy_from_user(&bp_req, (void __user *)arg, sizeof(bp_req)))
-            return -EFAULT;
-        usa_clear_hw_bp(bp_req.index);
-        return 0;
-
-    case OP_GET_BP_INFO: {
-        int idx;
-        unsigned long flags;
-        if (copy_from_user(&bp_hit, (void __user *)arg, sizeof(bp_hit)))
-            return -EFAULT;
-        idx = bp_hit.index;
-        if (idx < 0 || idx >= USA_MAX_HW_BP)
-            return -EINVAL;
-        spin_lock_irqsave(&bp_lock, flags);
-        bp_hit.hit       = usa_bp_state[idx].hit;
-        bp_hit.hit_addr  = usa_bp_state[idx].hit_addr;
-        bp_hit.hit_pc    = usa_bp_state[idx].hit_pc;
-        bp_hit.hit_count = usa_bp_state[idx].hit_count;
-        memcpy(bp_hit.regs, usa_bp_state[idx].regs, sizeof(bp_hit.regs));
-        usa_bp_state[idx].hit = 0; /* 读后清除 hit 标志 */
-        spin_unlock_irqrestore(&bp_lock, flags);
-        if (copy_to_user((void __user *)arg, &bp_hit, sizeof(bp_hit)))
-            return -EFAULT;
-        return 0;
-    }
-
-    case OP_CLEAR_ALL_BP:
-        usa_clear_all_bp();
-        return 0;
-
-    /* ===== 内核级注入 ===== */
-    case OP_INJECT_SO: {
-        INJECT_REQUEST inj;
-        if (copy_from_user(&inj, (void __user *)arg, sizeof(inj)))
-            return -EFAULT;
-        return usa_inject_so(&inj);
-    }
-
-    /* ===== 隐匿性增强 ===== */
-    case OP_HIDE_MAPS: {
-        /* arg = INJECT_REQUEST, pid + so_path 指定要隐藏的 */
-        INJECT_REQUEST req;
-        char path[256] = {0};
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
-            return -EFAULT;
-        if (copy_from_user(path, (void __user *)req.so_path, sizeof(path) - 1))
-            return -EFAULT;
-        return usa_hide_maps(req.pid, path);
-    }
-
-    case OP_HIDE_PROC: {
-        pid_t hide_pid;
-        if (copy_from_user(&hide_pid, (void __user *)arg, sizeof(pid_t)))
-            return -EFAULT;
-        return usa_hide_process(hide_pid);
-    }
+    case OP_HIDE_MAPS:
+        shm->result = usa_hide_maps(pid, shm->name);
+        break;
 
     default:
-        return task_tgid_vnr(current);
+        shm->result = -EINVAL;
+        break;
     }
 }
+
+/* =====================================================================
+ * kprobe on __arm64_sys_getpid — 通信触发器
+ *
+ * 99.99% 的 getpid 调用: PID 不匹配 → 立刻 return 0
+ * 只有 overlay 进程的 getpid 会触发命令处理
+ * ===================================================================== */
+
+static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    if (current->tgid != comm_pid)
+        return 0;
+
+    /* PID 匹配, 检查共享页是否有待处理命令 */
+    if (READ_ONCE(shm->state) != SHM_STATE_PENDING)
+        return 0;
+
+    /* MAGIC 验证 */
+    if (shm->magic != (uint32_t)(usa_magic & 0xFFFFFFFF))
+        return 0;
+
+    smp_rmb();
+    process_command();
+    smp_wmb();
+
+    WRITE_ONCE(shm->state, SHM_STATE_DONE);
+    return 0;
+}
+
+static struct kprobe kp_getpid = {
+    .symbol_name = "__arm64_sys_getpid",
+    .pre_handler = kp_pre_handler,
+};
 
 /* =====================================================================
  * 隐藏
  * ===================================================================== */
 
-static struct list_head *saved_prev = NULL;
-static int hidden = 0;
+static struct list_head *saved_prev;
+static int hidden;
 
-static void hide_module(void)
+static void hide_kprobe_from_list(struct kprobe *kp)
+{
+    if (kp->hlist.pprev) {
+        hlist_del_rcu(&kp->hlist);
+        kp->hlist.pprev = NULL;
+    }
+}
+
+static void __maybe_unused hide_module(void)
 {
     if (hidden) return;
     saved_prev = THIS_MODULE->list.prev;
     list_del_init(&THIS_MODULE->list);
-    kobject_del(&THIS_MODULE->mkobj.kobj);
     hidden = 1;
 }
 
@@ -737,40 +523,47 @@ static int __init driver_entry(void)
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    /* 解析硬件断点 API (可选) */
-    resolve_hw_bp_symbols();
+    resolve_symbols();
 
-    /* 解析注入 API (可选) */
-    resolve_inject_symbols();
+    /* 共享页 */
+    shm_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+    if (!shm_page) return -ENOMEM;
+    shm = (struct usa_shm *)page_address(shm_page);
 
-    /* #5 MAGIC 随机化 */
-    usa_randomize_magic();
-    usa_write_magic_file();
+    /* /proc 入口 */
+    usa_proc_entry = proc_create("gki_tracing", 0666, NULL, &usa_proc_ops);
+    if (!usa_proc_entry) {
+        __free_page(shm_page);
+        return -ENOMEM;
+    }
 
-    /* #6 kretprobe hook (不修改 sys_call_table) */
-    ret = register_kretprobe(&krp_getpid);
-    if (ret < 0) return ret;
-    register_kretprobe(&krp_gettid);
-    register_kretprobe(&krp_getppid);
+    /* kprobe on getpid */
+    ret = register_kprobe(&kp_getpid);
+    if (ret < 0) {
+        proc_remove(usa_proc_entry);
+        __free_page(shm_page);
+        return ret;
+    }
 
-    /* 从 kprobe 链表摘除 */
-    hide_kretprobe(&krp_getpid);
-    hide_kretprobe(&krp_gettid);
-    hide_kretprobe(&krp_getppid);
+    /* 隐藏 kprobe */
+    hide_kprobe_from_list(&kp_getpid);
 
-    hide_module();
+    memset(&shoot_state, 0, sizeof(shoot_state));
     return 0;
 }
 
 static void __exit driver_unload(void)
 {
-    usa_clear_all_bp();
+    /* 清理 Shoot */
+    if (shoot_state.bp_event) {
+        unregister_hw_breakpoint(shoot_state.bp_event);
+        shoot_state.bp_event = NULL;
+    }
 
-    /* kprobe 卸载 (需要先恢复到链表才能 unregister) */
-    unregister_kretprobe(&krp_getpid);
-    unregister_kretprobe(&krp_gettid);
-    unregister_kretprobe(&krp_getppid);
+    unregister_kprobe(&kp_getpid);
+    if (usa_proc_entry) proc_remove(usa_proc_entry);
     unhide_module();
+    if (shm_page) __free_page(shm_page);
 }
 
 module_init(driver_entry);

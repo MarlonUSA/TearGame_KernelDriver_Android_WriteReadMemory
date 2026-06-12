@@ -1,227 +1,220 @@
 /**
- * usa_client.h — Hook 版用户态通信接口 v2
+ * usa_client.h — kprobe getpid 触发 + 共享页通信
  *
- * 不需要 open 任何设备文件, 直接用 syscall 通信
- *
- * v2: 修复 opcode 和驱动一致 + 硬件断点/看门狗支持
- *
- * 用法:
- *   #include "usa_client.h"
- *
- *   // 内存读写
- *   usa_read(pid, addr, buf, size);
- *   usa_write(pid, addr, buf, size);
- *   unsigned long base = usa_get_module_base(pid, "libUE4.so");
- *
- *   // 硬件断点 (找"谁在访问这个地址")
- *   usa_set_watchpoint(0, pid, addr, USA_HW_BP_WRITE, 4);
- *   ... 等待游戏访问 ...
- *   usa_hw_bp_hit info;
- *   usa_get_bp_info(0, &info);
- *   if (info.hit) printf("指令 0x%lx 写了这个地址!", info.hit_pc);
+ * 流程:
+ *   usa_shm_init()      → mmap /proc/gki_tracing 获取共享页
+ *   写命令到共享页
+ *   getpid()            → 触发 kprobe → 内核处理命令
+ *   读结果从共享页
  */
 
 #ifndef USA_CLIENT_H
 #define USA_CLIENT_H
 
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <string.h>
 #include <stdint.h>
+#include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 
-/* #3 Syscall 轮转 + #5 MAGIC 随机化 */
-static int _usa_nr_pool[] = { __NR_getpid, __NR_gettid, __NR_getppid };
-static int _usa_nr_idx = 0;
-#define USA_SYSCALL_NR _usa_nr_pool[_usa_nr_idx]
-static inline void usa_rotate_syscall(void) {
-    _usa_nr_idx = (_usa_nr_idx + 1) % 3;
-}
-
-/* MAGIC: 从驱动写的文件读取, 每次加载驱动都不同 */
-#define USA_MAGIC_PATH "/data/local/tmp/.gs_m"
-static unsigned long _usa_magic = 0x55534100;
-#define USA_MAGIC _usa_magic
-
-static inline void usa_load_magic(void) {
-    FILE *f = fopen(USA_MAGIC_PATH, "r");
-    if (f) {
-        char buf[32] = {0};
-        if (fgets(buf, sizeof(buf), f))
-            _usa_magic = strtoul(buf, NULL, 16);
-        fclose(f);
-    }
-}
-
-/* ====== 操作码 (必须和 comm.h 一致!) ====== */
+/* 操作码 */
 #define OP_READ_MEM     0x801
 #define OP_WRITE_MEM    0x802
 #define OP_MODULE_BASE  0x803
-#define OP_SET_HW_BP    0x810
-#define OP_CLEAR_HW_BP  0x811
-#define OP_GET_BP_INFO  0x812
-#define OP_CLEAR_ALL_BP 0x813
 #define OP_INJECT_SO    0x820
 #define OP_HIDE_MAPS    0x830
-#define OP_HIDE_PROC    0x831
 
-/* ====== 硬件断点类型 ====== */
-#define USA_HW_BP_READ   1
-#define USA_HW_BP_WRITE  2
-#define USA_HW_BP_RW     3
-#define USA_MAX_HW_BP    4
+/* 共享页状态 */
+#define SHM_STATE_IDLE    0
+#define SHM_STATE_PENDING 1
+#define SHM_STATE_DONE    2
 
-/* ====== 结构体 ====== */
+/* 共享页布局 (和 entry.c 一致) */
+struct usa_shm {
+    volatile uint32_t state;
+    uint32_t magic;
+    uint32_t cmd;
+    int32_t  pid;
+    uint64_t addr;
+    uint64_t size;
+    int64_t  result;
+    char     name[256];
+    uint8_t  data[3800];
+};
 
-typedef struct {
-    int pid;
-    unsigned long addr;
-    void *buffer;
-    unsigned long size;
-} usa_copy_memory;
+static struct usa_shm *_usa_shm = NULL;
+static uint32_t _usa_magic = 0;
+static pthread_mutex_t _usa_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-typedef struct {
-    int pid;
-    char *name;
-    unsigned long base;
-} usa_module_base;
+#define USA_MAGIC_PATH "/data/local/tmp/.gs_m"
+#define USA_PROC_PATH  "/proc/gki_tracing"
 
-typedef struct {
-    int pid;
-    int index;           /* 0~3 */
-    unsigned long addr;
-    int type;            /* USA_HW_BP_READ/WRITE/RW */
-    int len;             /* 1, 2, 4, 8 */
-} usa_hw_bp_request;
+/* ====== 初始化 ====== */
 
-typedef struct {
-    int index;
-    int hit;
-    unsigned long hit_addr;
-    unsigned long hit_pc;
-    unsigned long regs[31];  /* x0~x30 */
-    int hit_count;
-} usa_hw_bp_hit;
+static inline int usa_shm_init(void)
+{
+    int fd;
+    FILE *f;
+    char buf[32] = {0};
+
+    f = fopen(USA_MAGIC_PATH, "r");
+    if (f) {
+        if (fgets(buf, sizeof(buf), f))
+            _usa_magic = (uint32_t)strtoul(buf, NULL, 16);
+        fclose(f);
+    }
+
+    fd = open(USA_PROC_PATH, O_RDWR);
+    if (fd < 0) return -1;
+
+    _usa_shm = (struct usa_shm *)mmap(NULL, 4096,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (_usa_shm == MAP_FAILED) {
+        _usa_shm = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static inline void usa_shm_cleanup(void)
+{
+    if (_usa_shm) { munmap(_usa_shm, 4096); _usa_shm = NULL; }
+}
+
+/* ====== 发送命令: 写共享页 → getpid() 触发 kprobe → 读结果 ====== */
+
+static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
+                                    uint64_t addr, uint64_t size)
+{
+    int retries;
+    int64_t result;
+
+    if (!_usa_shm) return -1;
+    pthread_mutex_lock(&_usa_mtx);
+
+    _usa_shm->magic  = _usa_magic;
+    _usa_shm->cmd    = cmd;
+    _usa_shm->pid    = pid;
+    _usa_shm->addr   = addr;
+    _usa_shm->size   = size;
+    _usa_shm->result = 0;
+    __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
+
+    /* getpid() 触发 kprobe → 内核在 pre_handler 里处理命令 */
+    syscall(__NR_getpid);
+
+    /* kprobe pre_handler 同步执行完毕, 检查结果 */
+    if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
+        result = _usa_shm->result;
+        __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&_usa_mtx);
+        return result;
+    }
+
+    /* 备用: 等几次 (不应该到这里, pre_handler 是同步的) */
+    for (retries = 0; retries < 100; retries++) {
+        syscall(__NR_getpid);
+        if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
+            result = _usa_shm->result;
+            __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&_usa_mtx);
+            return result;
+        }
+        usleep(100);
+    }
+
+    __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&_usa_mtx);
+    return -1;
+}
 
 /* ====== 内存读写 ====== */
 
 static inline int usa_read(int pid, unsigned long addr, void *buf, unsigned long size)
 {
-    usa_copy_memory cm = { .pid = pid, .addr = addr, .buffer = buf, .size = size };
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_READ_MEM, &cm);
+    int64_t ret;
+    if (!_usa_shm || size > sizeof(_usa_shm->data)) return -1;
+    ret = usa_send_cmd(OP_READ_MEM, pid, addr, size);
+    if (ret == 0)
+        memcpy(buf, _usa_shm->data, size);
+    return (int)ret;
 }
 
 static inline int usa_write(int pid, unsigned long addr, void *buf, unsigned long size)
 {
-    usa_copy_memory cm = { .pid = pid, .addr = addr, .buffer = buf, .size = size };
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_WRITE_MEM, &cm);
+    if (!_usa_shm || size > sizeof(_usa_shm->data)) return -1;
+    memcpy(_usa_shm->data, buf, size);
+    return (int)usa_send_cmd(OP_WRITE_MEM, pid, addr, size);
 }
 
 static inline unsigned long usa_get_module_base(int pid, const char *name)
 {
-    usa_module_base mb = { .pid = pid, .name = (char *)name, .base = 0 };
-    syscall(USA_SYSCALL_NR, USA_MAGIC, OP_MODULE_BASE, &mb);
-    return mb.base;
+    if (!_usa_shm) return 0;
+    memset(_usa_shm->name, 0, sizeof(_usa_shm->name));
+    strncpy(_usa_shm->name, name, sizeof(_usa_shm->name) - 1);
+    int64_t ret = usa_send_cmd(OP_MODULE_BASE, pid, 0, 0);
+    return (ret > 0) ? (unsigned long)ret : 0;
 }
 
-/* ====== 检测驱动是否加载 ====== */
+/* ====== 检测驱动 ====== */
 
 static inline int usa_driver_loaded(void)
 {
-    usa_copy_memory cm = { .pid = 0, .addr = 0, .buffer = NULL, .size = 0 };
-    int ret = syscall(USA_SYSCALL_NR, USA_MAGIC, OP_READ_MEM, &cm);
-    /* 如果驱动在, 返回 -EIO (因为参数无效)
-     * 如果驱动不在, 返回正常的 getpid 结果 (>0) */
-    return (ret < 0) ? 1 : 0;
+    return (_usa_shm != NULL) || (access(USA_PROC_PATH, F_OK) == 0);
 }
 
-/* ====== 硬件断点 ====== */
+/* ====== SO 注入 (传入 dlopen 地址, 由 overlay 计算) ====== */
 
-/**
- * 设置硬件看门狗
- *
- * @param index  0~3, ARM64 最多 4 个
- * @param pid    目标进程 PID
- * @param addr   要监视的地址
- * @param type   USA_HW_BP_READ / USA_HW_BP_WRITE / USA_HW_BP_RW
- * @param len    监视长度: 1, 2, 4, 8 字节
- * @return       0=成功, <0=失败
- */
-static inline int usa_set_watchpoint(int index, int pid,
-                                     unsigned long addr, int type, int len)
+static inline int usa_inject_so(int pid, const char *path, unsigned long dlopen_addr)
 {
-    usa_hw_bp_request req = {
-        .pid = pid, .index = index,
-        .addr = addr, .type = type, .len = len
-    };
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_SET_HW_BP, &req);
+    if (!_usa_shm) return -999;
+    pthread_mutex_lock(&_usa_mtx);
+
+    __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+    memset(_usa_shm->name, 0, sizeof(_usa_shm->name));
+    strncpy(_usa_shm->name, path, sizeof(_usa_shm->name) - 1);
+    _usa_shm->magic  = _usa_magic;
+    _usa_shm->cmd    = OP_INJECT_SO;
+    _usa_shm->pid    = pid;
+    _usa_shm->addr   = dlopen_addr;
+    _usa_shm->size   = 0;
+    _usa_shm->result = 0;
+    __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
+
+    /* 触发 kprobe */
+    syscall(__NR_getpid);
+
+    /* Shoot 注入是异步的 (等游戏线程触发 UXN 陷阱)
+     * 但 vm_mmap + shellcode 写入是同步的 */
+    int retries;
+    for (retries = 0; retries < 1000; retries++) {
+        if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE)
+            break;
+        syscall(__NR_getpid);
+        usleep(100);
+    }
+
+    int64_t result = _usa_shm->result;
+    __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&_usa_mtx);
+    return (int)result;
 }
 
-/**
- * 清除硬件断点
- */
-static inline int usa_clear_watchpoint(int index)
-{
-    usa_hw_bp_request req = { .index = index };
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_CLEAR_HW_BP, &req);
-}
+/* ====== Maps 隐藏 ====== */
 
-/**
- * 清除所有断点
- */
-static inline int usa_clear_all_watchpoints(void)
-{
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_CLEAR_ALL_BP, 0);
-}
-
-/**
- * 查询断点命中信息
- *
- * @param index  断点序号 0~3
- * @param info   输出, 填充命中信息
- * @return       0=成功
- *
- * 读后自动清除 hit 标志, 可循环轮询
- */
-static inline int usa_get_bp_info(int index, usa_hw_bp_hit *info)
-{
-    info->index = index;
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_GET_BP_INFO, info);
-}
-
-/* ====== 内核级 SO 注入 (无 ptrace) ====== */
-
-typedef struct {
-    int pid;
-    char *so_path;
-    int result;
-} usa_inject_request;
-
-/**
- * 通过内核驱动注入 .so 到目标进程
- * 无 ptrace, 无 TracerPid 痕迹
- *
- * @param pid  目标进程 PID
- * @param path .so 文件路径
- * @return     0=成功, <0=失败
- */
-static inline int usa_inject_so(int pid, const char *path)
-{
-    usa_inject_request req = { .pid = pid, .so_path = (char *)path, .result = 0 };
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_INJECT_SO, &req);
-}
-
-/* ====== #1 隐藏注入的 .so 从 /proc/pid/maps ====== */
 static inline int usa_hide_maps(int pid, const char *lib_name)
 {
-    usa_inject_request req = { .pid = pid, .so_path = (char *)lib_name, .result = 0 };
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_HIDE_MAPS, &req);
-}
-
-/* ====== #2 隐藏进程从 /proc (ps/top 不可见) ====== */
-static inline int usa_hide_process(int pid)
-{
-    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_HIDE_PROC, &pid);
+    if (!_usa_shm) return -1;
+    memset(_usa_shm->name, 0, sizeof(_usa_shm->name));
+    strncpy(_usa_shm->name, lib_name, sizeof(_usa_shm->name) - 1);
+    return (int)usa_send_cmd(OP_HIDE_MAPS, pid, 0, 0);
 }
 
 /* ====== C++ 模板 ====== */
