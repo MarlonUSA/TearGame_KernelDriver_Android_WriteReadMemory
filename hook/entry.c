@@ -19,7 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/version.h>
-#include <linux/set_memory.h>
+/* set_memory_rw/ro 通过 kallsyms 运行时解析, 不直接 include */
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/list.h>
@@ -59,38 +59,25 @@ static int resolve_kallsyms(void)
  * ===================================================================== */
 
 static void **sys_call_table = NULL;
-static void *original_syscall = NULL;  /* 保存原始的 syscall 600 处理函数 */
+static void *original_syscall = NULL;
 
-/* 修改页表权限: 让 sys_call_table 可写 */
+/* 函数指针: 运行时通过 kallsyms 解析 (GKI 不导出这些符号) */
+typedef int (*set_memory_fn_t)(unsigned long addr, int numpages);
+static set_memory_fn_t my_set_memory_rw = NULL;
+static set_memory_fn_t my_set_memory_ro = NULL;
+
 static int make_rw(unsigned long addr)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    return set_memory_rw(addr & PAGE_MASK, 1);
-#else
-    /* 老内核: 直接改 PTE */
-    unsigned int level;
-    pte_t *pte = lookup_address(addr, &level);
-    if (pte) {
-        pte->pte |= _PAGE_RW;
-        return 0;
-    }
+    if (my_set_memory_rw)
+        return my_set_memory_rw(addr & PAGE_MASK, 1);
     return -1;
-#endif
 }
 
 static int make_ro(unsigned long addr)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    return set_memory_ro(addr & PAGE_MASK, 1);
-#else
-    unsigned int level;
-    pte_t *pte = lookup_address(addr, &level);
-    if (pte) {
-        pte->pte &= ~_PAGE_RW;
-        return 0;
-    }
+    if (my_set_memory_ro)
+        return my_set_memory_ro(addr & PAGE_MASK, 1);
     return -1;
-#endif
 }
 
 /* =====================================================================
@@ -188,7 +175,11 @@ static int __init driver_entry(void)
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    /* 2. 找到 sys_call_table */
+    /* 2. 解析 set_memory_rw/ro */
+    my_set_memory_rw = (set_memory_fn_t)kln_func("set_memory_rw");
+    my_set_memory_ro = (set_memory_fn_t)kln_func("set_memory_ro");
+
+    /* 3. 找到 sys_call_table */
     sys_call_table = (void **)kln_func("sys_call_table");
     if (!sys_call_table) return -ENOENT;
 
