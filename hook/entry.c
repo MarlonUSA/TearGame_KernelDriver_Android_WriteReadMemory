@@ -19,7 +19,9 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/version.h>
-/* set_memory_rw/ro 通过 kallsyms 运行时解析, 不直接 include */
+#include <linux/mm.h>
+#include <asm/tlbflush.h>
+#include <asm/pgtable.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/list.h>
@@ -62,19 +64,63 @@ static void **sys_call_table = NULL;
 static void *original_syscall = NULL;
 
 /*
- * ARM64 安全写 sys_call_table 的方式:
- * 用 copy_to_kernel_nofault (原 probe_kernel_write)
- * 这个函数能写任意内核地址，即使是只读的
- * 内核自己用它来做 ftrace/kprobes 的代码补丁
+ * ARM64 上修改 sys_call_table 的正确方式:
+ * 直接遍历页表找到 PTE，翻转写保护位
+ * 参考: github.com/memory1337/syscall_hook_forlinux
  */
-typedef long (*copy_to_kernel_nofault_fn_t)(void *dst, const void *src, size_t size);
-static copy_to_kernel_nofault_fn_t my_copy_to_kernel = NULL;
 
-static int write_syscall_table(void **table, int nr, void *new_fn)
+static pte_t *pte_from_addr(unsigned long addr)
 {
-    if (my_copy_to_kernel)
-        return my_copy_to_kernel(&table[nr], &new_fn, sizeof(void *));
-    return -1;
+    pgd_t *pgd;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *ptep;
+    struct mm_struct *mm;
+
+    mm = (struct mm_struct *)kln_func("init_mm");
+    if (!mm) return NULL;
+
+    pgd = pgd_offset(mm, addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    {
+        p4d_t *p4d = p4d_offset(pgd, addr);
+        if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
+        pud = pud_offset(p4d, addr);
+    }
+#else
+    pud = pud_offset(pgd, addr);
+#endif
+    if (pud_none(*pud) || pud_bad(*pud)) return NULL;
+
+    pmd = pmd_offset(pud, addr);
+    if (pmd_none(*pmd) || pmd_bad(*pmd)) return NULL;
+
+    ptep = pte_offset_kernel(pmd, addr);
+    if (!ptep || pte_none(*ptep)) return NULL;
+
+    return ptep;
+}
+
+static void make_addr_rw(unsigned long addr)
+{
+    pte_t *ptep = pte_from_addr(addr);
+    if (ptep) {
+        *ptep = pte_mkwrite(pte_mkdirty(*ptep));
+        /* 清除 PTE_RDONLY bit (bit 7 on ARM64) */
+        *ptep = clear_pte_bit(*ptep, __pgprot(PTE_RDONLY));
+        flush_tlb_all();
+    }
+}
+
+static void make_addr_ro(unsigned long addr)
+{
+    pte_t *ptep = pte_from_addr(addr);
+    if (ptep) {
+        *ptep = pte_wrprotect(*ptep);
+        flush_tlb_all();
+    }
 }
 
 /* =====================================================================
@@ -172,18 +218,15 @@ static int __init driver_entry(void)
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    /* 2. 解析 copy_to_kernel_nofault */
-    my_copy_to_kernel = (copy_to_kernel_nofault_fn_t)kln_func("copy_to_kernel_nofault");
-    if (!my_copy_to_kernel)
-        my_copy_to_kernel = (copy_to_kernel_nofault_fn_t)kln_func("probe_kernel_write");
-
-    /* 3. 找到 sys_call_table */
+    /* 2. 找到 sys_call_table */
     sys_call_table = (void **)kln_func("sys_call_table");
     if (!sys_call_table) return -ENOENT;
 
-    /* 4. 保存原始 syscall 600 并替换 */
+    /* 3. 保存原始 syscall 600，翻转 PTE 写保护，替换 */
     original_syscall = sys_call_table[USA_SYSCALL_NR];
-    write_syscall_table(sys_call_table, USA_SYSCALL_NR, (void *)usa_syscall_handler);
+    make_addr_rw((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
+    sys_call_table[USA_SYSCALL_NR] = (void *)usa_syscall_handler;
+    make_addr_ro((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
 
     /* 4. 隐藏模块 */
     hide_module();
@@ -195,8 +238,11 @@ static int __init driver_entry(void)
 static void __exit driver_unload(void)
 {
     /* 恢复原始 syscall */
-    if (sys_call_table && original_syscall)
-        write_syscall_table(sys_call_table, USA_SYSCALL_NR, original_syscall);
+    if (sys_call_table && original_syscall) {
+        make_addr_rw((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
+        sys_call_table[USA_SYSCALL_NR] = original_syscall;
+        make_addr_ro((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
+    }
 
     /* 恢复模块链表 */
     unhide_module();
