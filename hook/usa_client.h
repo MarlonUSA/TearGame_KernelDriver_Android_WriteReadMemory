@@ -30,13 +30,27 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* #3 Syscall 轮转: getpid/gettid/getppid 随机切换 */
-#define USA_MAGIC      0x55534100
+/* #3 Syscall 轮转 + #5 MAGIC 随机化 */
 static int _usa_nr_pool[] = { __NR_getpid, __NR_gettid, __NR_getppid };
 static int _usa_nr_idx = 0;
 #define USA_SYSCALL_NR _usa_nr_pool[_usa_nr_idx]
 static inline void usa_rotate_syscall(void) {
     _usa_nr_idx = (_usa_nr_idx + 1) % 3;
+}
+
+/* MAGIC: 从驱动写的文件读取, 每次加载驱动都不同 */
+#define USA_MAGIC_PATH "/data/local/tmp/.gs_m"
+static unsigned long _usa_magic = 0x55534100;
+#define USA_MAGIC _usa_magic
+
+static inline void usa_load_magic(void) {
+    FILE *f = fopen(USA_MAGIC_PATH, "r");
+    if (f) {
+        char buf[32] = {0};
+        if (fgets(buf, sizeof(buf), f))
+            _usa_magic = strtoul(buf, NULL, 16);
+        fclose(f);
+    }
 }
 
 /* ====== 操作码 (必须和 comm.h 一致!) ====== */

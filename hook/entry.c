@@ -50,7 +50,33 @@
 #define USA_HOOK_NR0 __NR_getpid
 #define USA_HOOK_NR1 __NR_gettid
 #define USA_HOOK_NR2 __NR_getppid
-#define USA_MAGIC    0x55534100
+
+/* #5 MAGIC 随机化: 启动时生成, 写入文件给用户态读 */
+#define USA_MAGIC_PATH "/data/local/tmp/.gs_m"
+static unsigned long usa_magic = 0x55534100; /* 默认值, 运行时会被随机替换 */
+
+static void usa_randomize_magic(void)
+{
+    unsigned long rand_val;
+    get_random_bytes(&rand_val, sizeof(rand_val));
+    /* 保留高 8 bits 为 0x55 作为签名, 低 24 bits 随机 */
+    usa_magic = 0x55000000UL | (rand_val & 0x00FFFFFFUL);
+}
+
+static void usa_write_magic_file(void)
+{
+    struct file *f;
+    char buf[32];
+    int len;
+    loff_t pos = 0;
+
+    len = snprintf(buf, sizeof(buf), "%lx", usa_magic);
+    f = filp_open(USA_MAGIC_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (!IS_ERR(f)) {
+        kernel_write(f, buf, len, &pos);
+        filp_close(f, NULL);
+    }
+}
 
 MODULE_LICENSE("GPL");
 
@@ -396,8 +422,7 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
 
 /* #2 隐藏指定进程的 /proc 条目 */
 /* 通过从 pid namespace 的链表中移除 */
-static struct pid *hidden_pid = NULL;
-static struct hlist_node saved_pid_chain = {0};
+static struct pid __maybe_unused *hidden_pid = NULL;
 
 static int usa_hide_process(pid_t target_pid)
 {
@@ -495,7 +520,7 @@ static long usa_hooked_getpid(const struct pt_regs *regs)
     HW_BP_HIT bp_hit;
     char name[0x100] = {0};
 
-    if (magic != USA_MAGIC)
+    if (magic != usa_magic)
         return ((syscall_fn_t)orig_getpid)(regs);
 
     switch (cmd) {
@@ -638,6 +663,10 @@ static int __init driver_entry(void)
 
     /* 解析注入 API (可选) */
     resolve_inject_symbols();
+
+    /* #5 MAGIC 随机化 */
+    usa_randomize_magic();
+    usa_write_magic_file();
 
     /* #3 Syscall 轮转: hook 三个 syscall */
     orig_getpid = sys_call_table[USA_HOOK_NR0];
