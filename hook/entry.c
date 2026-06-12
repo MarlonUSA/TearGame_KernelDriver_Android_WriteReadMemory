@@ -63,17 +63,29 @@ static void usa_randomize_magic(void)
     usa_magic = 0x55000000UL | (rand_val & 0x00FFFFFFUL);
 }
 
+/* filp_open/kernel_write 在 GKI 内核不导出
+ * 改用 kallsyms 解析, 失败则跳过 (用默认 MAGIC) */
+typedef struct file *(*filp_open_t)(const char *, int, umode_t);
+typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
+
 static void usa_write_magic_file(void)
 {
+    filp_open_t fn_filp_open;
+    kernel_write_t fn_kernel_write;
     struct file *f;
     char buf[32];
     int len;
     loff_t pos = 0;
 
+    if (!kln_func) return;
+    fn_filp_open = (filp_open_t)kln_func("filp_open");
+    fn_kernel_write = (kernel_write_t)kln_func("kernel_write");
+    if (!fn_filp_open || !fn_kernel_write) return;
+
     len = snprintf(buf, sizeof(buf), "%lx", usa_magic);
-    f = filp_open(USA_MAGIC_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    f = fn_filp_open(USA_MAGIC_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (!IS_ERR(f)) {
-        kernel_write(f, buf, len, &pos);
+        fn_kernel_write(f, buf, len, &pos);
         filp_close(f, NULL);
     }
 }
