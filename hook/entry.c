@@ -61,23 +61,40 @@ static int resolve_kallsyms(void)
 static void **sys_call_table = NULL;
 static void *original_syscall = NULL;
 
-/* 函数指针: 运行时通过 kallsyms 解析 (GKI 不导出这些符号) */
-typedef int (*set_memory_fn_t)(unsigned long addr, int numpages);
-static set_memory_fn_t my_set_memory_rw = NULL;
-static set_memory_fn_t my_set_memory_ro = NULL;
+/*
+ * ARM64 上不能用 set_memory_rw 修改 sys_call_table (触发 WXN panic)
+ * 使用 update_mapping_prot 临时改 section 映射权限
+ * 这是 ARM64 内核自己用来修改 rodata 的方式
+ */
+typedef void (*update_mapping_prot_fn_t)(phys_addr_t phys, unsigned long virt,
+                                         phys_addr_t size, pgprot_t prot);
+static update_mapping_prot_fn_t my_update_mapping_prot = NULL;
 
-static int make_rw(unsigned long addr)
+/* 内核的 start_rodata / end_rodata 地址 */
+static unsigned long *my_start_rodata = NULL;
+static unsigned long *my_end_rodata = NULL;
+
+/* init_mm 用于获取 pgdir */
+static struct mm_struct *my_init_mm = NULL;
+
+static void make_rw(void)
 {
-    if (my_set_memory_rw)
-        return my_set_memory_rw(addr & PAGE_MASK, 1);
-    return -1;
+    if (my_update_mapping_prot && my_start_rodata && my_end_rodata && my_init_mm) {
+        my_update_mapping_prot(__pa_symbol(my_start_rodata),
+                               (unsigned long)my_start_rodata,
+                               (unsigned long)my_end_rodata - (unsigned long)my_start_rodata,
+                               PAGE_KERNEL);
+    }
 }
 
-static int make_ro(unsigned long addr)
+static void make_ro(void)
 {
-    if (my_set_memory_ro)
-        return my_set_memory_ro(addr & PAGE_MASK, 1);
-    return -1;
+    if (my_update_mapping_prot && my_start_rodata && my_end_rodata && my_init_mm) {
+        my_update_mapping_prot(__pa_symbol(my_start_rodata),
+                               (unsigned long)my_start_rodata,
+                               (unsigned long)my_end_rodata - (unsigned long)my_start_rodata,
+                               PAGE_KERNEL_RO);
+    }
 }
 
 /* =====================================================================
@@ -175,20 +192,22 @@ static int __init driver_entry(void)
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    /* 2. 解析 set_memory_rw/ro */
-    my_set_memory_rw = (set_memory_fn_t)kln_func("set_memory_rw");
-    my_set_memory_ro = (set_memory_fn_t)kln_func("set_memory_ro");
+    /* 2. 解析 ARM64 内存映射修改函数 */
+    my_update_mapping_prot = (update_mapping_prot_fn_t)kln_func("update_mapping_prot");
+    my_start_rodata = (unsigned long *)kln_func("__start_rodata");
+    my_end_rodata = (unsigned long *)kln_func("__end_rodata");
+    my_init_mm = (struct mm_struct *)kln_func("init_mm");
 
     /* 3. 找到 sys_call_table */
     sys_call_table = (void **)kln_func("sys_call_table");
     if (!sys_call_table) return -ENOENT;
 
-    /* 3. 保存原始 syscall 600 并替换为我们的 */
+    /* 4. 保存原始 syscall 600 并替换为我们的 */
     original_syscall = sys_call_table[USA_SYSCALL_NR];
 
-    make_rw((unsigned long)sys_call_table);
+    make_rw();
     sys_call_table[USA_SYSCALL_NR] = (void *)usa_syscall_handler;
-    make_ro((unsigned long)sys_call_table);
+    make_ro();
 
     /* 4. 隐藏模块 */
     hide_module();
@@ -201,9 +220,9 @@ static void __exit driver_unload(void)
 {
     /* 恢复原始 syscall */
     if (sys_call_table && original_syscall) {
-        make_rw((unsigned long)sys_call_table);
+        make_rw();
         sys_call_table[USA_SYSCALL_NR] = original_syscall;
-        make_ro((unsigned long)sys_call_table);
+        make_ro();
     }
 
     /* 恢复模块链表 */
