@@ -107,7 +107,7 @@ static int resolve_kallsyms(void)
  * 隐匿: 注册后从 kprobe 内部链表摘除, debugfs 不可见
  * ===================================================================== */
 
-static void *orig_getpid = NULL; /* 保存原始函数地址用于回调 */
+static void __maybe_unused *orig_getpid = NULL;
 
 /* 前向声明 */
 static long usa_hooked_getpid(const struct pt_regs *regs);
