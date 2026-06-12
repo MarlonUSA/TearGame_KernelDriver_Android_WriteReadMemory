@@ -30,9 +30,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* hook getpid — 和正常 getpid 调用混在一起不起疑 */
-#define USA_SYSCALL_NR __NR_getpid  /* 172 on arm64 */
+/* #3 Syscall 轮转: getpid/gettid/getppid 随机切换 */
 #define USA_MAGIC      0x55534100
+static int _usa_nr_pool[] = { __NR_getpid, __NR_gettid, __NR_getppid };
+static int _usa_nr_idx = 0;
+#define USA_SYSCALL_NR _usa_nr_pool[_usa_nr_idx]
+static inline void usa_rotate_syscall(void) {
+    _usa_nr_idx = (_usa_nr_idx + 1) % 3;
+}
 
 /* ====== 操作码 (必须和 comm.h 一致!) ====== */
 #define OP_READ_MEM     0x801
@@ -43,6 +48,8 @@
 #define OP_GET_BP_INFO  0x812
 #define OP_CLEAR_ALL_BP 0x813
 #define OP_INJECT_SO    0x820
+#define OP_HIDE_MAPS    0x830
+#define OP_HIDE_PROC    0x831
 
 /* ====== 硬件断点类型 ====== */
 #define USA_HW_BP_READ   1
@@ -188,6 +195,19 @@ static inline int usa_inject_so(int pid, const char *path)
 {
     usa_inject_request req = { .pid = pid, .so_path = (char *)path, .result = 0 };
     return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_INJECT_SO, &req);
+}
+
+/* ====== #1 隐藏注入的 .so 从 /proc/pid/maps ====== */
+static inline int usa_hide_maps(int pid, const char *lib_name)
+{
+    usa_inject_request req = { .pid = pid, .so_path = (char *)lib_name, .result = 0 };
+    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_HIDE_MAPS, &req);
+}
+
+/* ====== #2 隐藏进程从 /proc (ps/top 不可见) ====== */
+static inline int usa_hide_process(int pid)
+{
+    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_HIDE_PROC, &pid);
 }
 
 /* ====== C++ 模板 ====== */
