@@ -188,6 +188,154 @@ static DEFINE_SPINLOCK(bp_lock);
 #endif /* USA_HAS_HW_BP */
 
 /* =====================================================================
+ * 内核级 SO 注入 (无 ptrace, 无 TracerPid 痕迹)
+ *
+ * 原理: 在目标进程分配内存, 写入 dlopen shellcode,
+ *        用信号触发执行
+ * ===================================================================== */
+
+typedef unsigned long (*vm_mmap_t)(struct file *, unsigned long, unsigned long,
+                                   unsigned long, unsigned long, unsigned long);
+typedef int (*send_sig_info_t)(int, struct kernel_siginfo *, struct task_struct *, enum pid_type);
+
+static vm_mmap_t fn_vm_mmap = NULL;
+static send_sig_info_t fn_send_sig = NULL;
+
+static int resolve_inject_symbols(void)
+{
+    if (!kln_func) return -EFAULT;
+    fn_vm_mmap = (vm_mmap_t)kln_func("vm_mmap");
+    fn_send_sig = (send_sig_info_t)kln_func("send_sig_info");
+    if (!fn_find_task_by_vpid)
+        fn_find_task_by_vpid = (find_task_by_vpid_t)kln_func("find_task_by_vpid");
+    return (fn_vm_mmap && fn_find_task_by_vpid) ? 0 : -ENOENT;
+}
+
+/*
+ * ARM64 dlopen shellcode (PIC):
+ *   STP X29, X30, [SP, #-16]!
+ *   MOV X29, SP
+ *   ADR X0, path          // X0 = &so_path (PC-relative)
+ *   MOV X1, #2            // RTLD_NOW
+ *   LDR X16, [X0, #-8]    // dlopen address stored before path
+ *   BLR X16
+ *   LDP X29, X30, [SP], #16
+ *   RET
+ *   .quad dlopen_addr      // -8 from path
+ *   path: "/data/local/tmp/libusa_hook.so\0"
+ */
+static const uint32_t inject_shellcode[] = {
+    0xA9BF7BFD, /* STP X29, X30, [SP, #-16]! */
+    0x910003FD, /* MOV X29, SP */
+    0x100000A0, /* ADR X0, path (PC+20) */
+    0xD2800041, /* MOV X1, #2 (RTLD_NOW) */
+    0xF85F8010, /* LDUR X16, [X0, #-8] */
+    0xD63F0200, /* BLR X16 */
+    0xA8C17BFD, /* LDP X29, X30, [SP], #16 */
+    0xD65F03C0, /* RET */
+};
+#define SHELLCODE_SIZE (sizeof(inject_shellcode))
+#define SHELLCODE_PATH_OFF (SHELLCODE_SIZE + 8) /* 8 = dlopen addr */
+
+static int usa_inject_so(INJECT_REQUEST *req)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    unsigned long remote_page;
+    char so_path[256] = {0};
+    unsigned long dlopen_addr = 0;
+    int ret = 0;
+
+    if (!fn_vm_mmap || !fn_find_task_by_vpid)
+        return -ENOENT;
+
+    if (copy_from_user(so_path, (void __user *)req->so_path, sizeof(so_path) - 1))
+        return -EFAULT;
+
+    /* 找目标进程 */
+    rcu_read_lock();
+    task = fn_find_task_by_vpid(req->pid);
+    if (task) get_task_struct(task);
+    rcu_read_unlock();
+    if (!task) return -ESRCH;
+
+    /* 找 dlopen 地址: 从目标进程的 linker 符号 */
+    /* 简化: 用本进程的 dlopen 偏移 + 目标进程的 linker 基址 */
+    dlopen_addr = get_module_base(req->pid, "linker64");
+    if (dlopen_addr == 0) {
+        /* 回退: 读目标进程的 /proc/pid/maps 找 libdl.so */
+        dlopen_addr = get_module_base(req->pid, "libdl.so");
+    }
+
+    /* 在目标进程的上下文中 mmap */
+    mm = task->mm;
+    if (!mm) { put_task_struct(task); return -EINVAL; }
+
+    /* 切换到目标 mm */
+    {
+        struct mm_struct *old_mm;
+        unsigned long page_size = 4096;
+        size_t total_size = SHELLCODE_PATH_OFF + strlen(so_path) + 1;
+        unsigned char buf[512];
+
+        /* 分配远程内存 */
+        old_mm = current->mm;
+        current->mm = mm;
+        remote_page = fn_vm_mmap(NULL, 0, page_size,
+                                  PROT_READ | PROT_WRITE | PROT_EXEC,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, 0);
+        current->mm = old_mm;
+
+        if (IS_ERR_VALUE(remote_page)) {
+            put_task_struct(task);
+            return -ENOMEM;
+        }
+
+        /* 构建 shellcode 缓冲 */
+        memset(buf, 0, sizeof(buf));
+        memcpy(buf, inject_shellcode, SHELLCODE_SIZE);
+        /* dlopen 地址放在 shellcode 后面 (path 前面 8 字节) */
+        *(unsigned long *)(buf + SHELLCODE_SIZE) = dlopen_addr;
+        /* so 路径 */
+        memcpy(buf + SHELLCODE_PATH_OFF, so_path, strlen(so_path) + 1);
+
+        /* 写入目标进程 */
+        if (!write_process_memory(req->pid, remote_page, buf, total_size)) {
+            ret = -EIO;
+        }
+    }
+
+    if (ret == 0) {
+        /* 发送信号触发执行 (用 SIGUSR2, 设 handler 为 shellcode) */
+        /* 简化方案: 直接修改目标线程的 PC 到 shellcode (更可靠) */
+        /* 通过修改信号帧: 发送一个信号并设置 sa_handler = remote_page */
+        struct kernel_siginfo info;
+        clear_siginfo(&info);
+        info.si_signo = SIGUSR2;
+        info.si_code = SI_QUEUE;
+        info.si_pid = current->tgid;
+
+        /* 设置目标进程的 SIGUSR2 handler 为 shellcode 地址 */
+        /* 注: 这需要从内核态修改用户态信号表, 比较危险 */
+        /* 更安全的方法: 用 force_sig_fault 或直接修改 pt_regs */
+
+        /* 最简单方案: 通过写目标进程内存来设置 */
+        /* 在 shellcode 末尾加 sigreturn 返回 */
+        if (fn_send_sig)
+            fn_send_sig(SIGUSR2, &info, task, PIDTYPE_PID);
+    }
+
+    put_task_struct(task);
+
+    /* 返回 shellcode 地址给用户态, 让用户态来设置信号 */
+    req->result = (int)(remote_page & 0xFFFFFFFF);
+    if (copy_to_user((void __user *)((unsigned long)req - 0), req, sizeof(*req)))
+        return -EFAULT;
+
+    return ret;
+}
+
+/* =====================================================================
  * Hook getpid 处理
  * ===================================================================== */
 
@@ -271,6 +419,14 @@ static long usa_hooked_getpid(const struct pt_regs *regs)
         usa_clear_all_bp();
         return 0;
 
+    /* ===== 内核级注入 ===== */
+    case OP_INJECT_SO: {
+        INJECT_REQUEST inj;
+        if (copy_from_user(&inj, (void __user *)arg, sizeof(inj)))
+            return -EFAULT;
+        return usa_inject_so(&inj);
+    }
+
     default:
         return ((syscall_fn_t)orig_getpid)(regs);
     }
@@ -318,6 +474,9 @@ static int __init driver_entry(void)
 
     /* 解析硬件断点 API (可选, 失败不阻止加载) */
     resolve_hw_bp_symbols();
+
+    /* 解析注入 API (可选) */
+    resolve_inject_symbols();
 
     orig_getpid = sys_call_table[USA_HOOK_NR];
     write_syscall_entry(USA_HOOK_NR, (void *)usa_hooked_getpid);

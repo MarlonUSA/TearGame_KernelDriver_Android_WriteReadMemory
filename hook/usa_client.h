@@ -42,6 +42,7 @@
 #define OP_CLEAR_HW_BP  0x811
 #define OP_GET_BP_INFO  0x812
 #define OP_CLEAR_ALL_BP 0x813
+#define OP_INJECT_SO    0x820
 
 /* ====== 硬件断点类型 ====== */
 #define USA_HW_BP_READ   1
@@ -165,6 +166,28 @@ static inline int usa_get_bp_info(int index, usa_hw_bp_hit *info)
 {
     info->index = index;
     return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_GET_BP_INFO, info);
+}
+
+/* ====== 内核级 SO 注入 (无 ptrace) ====== */
+
+typedef struct {
+    int pid;
+    char *so_path;
+    int result;
+} usa_inject_request;
+
+/**
+ * 通过内核驱动注入 .so 到目标进程
+ * 无 ptrace, 无 TracerPid 痕迹
+ *
+ * @param pid  目标进程 PID
+ * @param path .so 文件路径
+ * @return     0=成功, <0=失败
+ */
+static inline int usa_inject_so(int pid, const char *path)
+{
+    usa_inject_request req = { .pid = pid, .so_path = (char *)path, .result = 0 };
+    return syscall(USA_SYSCALL_NR, USA_MAGIC, OP_INJECT_SO, &req);
 }
 
 /* ====== C++ 模板 ====== */

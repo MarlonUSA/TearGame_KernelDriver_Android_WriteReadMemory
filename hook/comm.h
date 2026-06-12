@@ -61,6 +61,16 @@ enum OPERATIONS
 	OP_CLEAR_HW_BP = 0x811,
 	OP_GET_BP_INFO = 0x812,
 	OP_CLEAR_ALL_BP= 0x813,
+
+	/* 内核级 SO 注入 */
+	OP_INJECT_SO   = 0x820,
 };
+
+typedef struct _INJECT_REQUEST
+{
+	pid_t pid;
+	char *so_path;
+	int result;
+} INJECT_REQUEST;
 
 #endif /* _USA_COMM_H_ */
