@@ -63,6 +63,10 @@ static void usa_randomize_magic(void)
     usa_magic = 0x55000000UL | (rand_val & 0x00FFFFFFUL);
 }
 
+/* 前向声明 */
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t kln_func;
+
 /* filp_open/kernel_write 在 GKI 内核不导出
  * 改用 kallsyms 解析, 失败则跳过 (用默认 MAGIC) */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
@@ -96,8 +100,7 @@ MODULE_LICENSE("GPL");
  * kallsyms (kprobe)
  * ===================================================================== */
 
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-static kallsyms_lookup_name_t kln_func = NULL;
+/* kln_func 已在前面声明 */
 
 static int resolve_kallsyms(void)
 {
