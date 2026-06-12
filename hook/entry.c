@@ -113,8 +113,7 @@ static void usa_bp_handler(struct perf_event *bp,
             usa_bp_state[i].hit_pc = regs->pc;
             usa_bp_state[i].hit_addr = bp->attr.bp_addr;
             usa_bp_state[i].hit_count++;
-            if (regs->regs)
-                memcpy(usa_bp_state[i].regs, regs->regs, sizeof(unsigned long) * 31);
+            memcpy(usa_bp_state[i].regs, regs->regs, sizeof(unsigned long) * 31);
             break;
         }
     }
