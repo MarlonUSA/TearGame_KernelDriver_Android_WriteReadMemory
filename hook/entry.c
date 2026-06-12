@@ -98,26 +98,71 @@ static int resolve_kallsyms(void)
 }
 
 /* =====================================================================
- * 安全写 sys_call_table (ARM64)
+ * #6 kprobe-based syscall hook (不修改 sys_call_table)
+ *
+ * 原理: 在 __arm64_sys_getpid 等函数入口注册 kprobe
+ *        pre_handler 检查 MAGIC, 命中则处理命令并修改 PC 跳过原函数
+ *        sys_call_table 完全不动, 完整性校验通过
+ *
+ * 隐匿: 注册后从 kprobe 内部链表摘除, debugfs 不可见
  * ===================================================================== */
 
-static void **sys_call_table = NULL;
-static void *orig_getpid = NULL;
-static void *orig_gettid = NULL;
-static void *orig_getppid = NULL;
+static void *orig_getpid = NULL; /* 保存原始函数地址用于回调 */
 
-typedef int (*insn_patch_fn_t)(void *addr, u32 insn);
-static insn_patch_fn_t my_patch_text = NULL;
+/* kprobe 实例 (每个 syscall 一个) */
+static struct kprobe kp_getpid  = { .symbol_name = "__arm64_sys_getpid" };
+static struct kprobe kp_gettid  = { .symbol_name = "__arm64_sys_gettid" };
+static struct kprobe kp_getppid = { .symbol_name = "__arm64_sys_getppid" };
 
-static void write_syscall_entry(int nr, void *handler)
+/* 前向声明 */
+static long usa_hooked_getpid(const struct pt_regs *regs);
+
+/* kprobe pre_handler: 在 syscall 执行前拦截
+ *
+ * ARM64 syscall 调用链:
+ *   el0_svc → invoke_syscall → __arm64_sys_getpid(regs)
+ *   regs->regs[0] 是指向用户态 pt_regs 的指针
+ *   __arm64_sys_getpid 内部读 user_regs->regs[0] 获取用户态 x0
+ *
+ * 策略: 在 pre_handler 中检查用户态 x0 是否是 MAGIC
+ *        如果是, 处理命令, 然后修改 regs 让原函数跳过 (pc = lr)
+ */
+static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-    unsigned long val = (unsigned long)handler;
-    u32 lo = (u32)(val & 0xFFFFFFFF);
-    u32 hi = (u32)(val >> 32);
+    struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+    unsigned long magic;
 
-    if (my_patch_text) {
-        my_patch_text(&sys_call_table[nr], lo);
-        my_patch_text((void *)((unsigned long)&sys_call_table[nr] + 4), hi);
+    if (!user_regs)
+        return 0;
+
+    if (copy_from_user(&magic, &user_regs->regs[0], sizeof(magic)))
+        return 0;
+
+    if (magic != usa_magic)
+        return 0;
+
+    /* 是我们的命令 */
+    {
+        long ret = usa_hooked_getpid(user_regs);
+
+        /* 修改返回值: 原函数返回 x0, 我们直接设 */
+        regs->regs[0] = (unsigned long)ret;
+
+        /* 跳过原函数: 设 PC = LR, 直接返回调用者 */
+        regs->pc = regs->regs[30];
+    }
+
+    return 1; /* 返回 1 = 不再执行被探测的指令 */
+}
+
+/* 从 kprobe 内部链表摘除 (debugfs/kprobes/list 不可见) */
+static void hide_kprobe(struct kprobe *kp)
+{
+    /* kprobe 注册后在 kprobe_table hash 中
+     * 摘除后 /sys/kernel/debug/kprobes/list 看不到 */
+    if (kp->hlist.pprev) {
+        hlist_del_rcu(&kp->hlist);
+        kp->hlist.pprev = NULL;
     }
 }
 
@@ -521,7 +566,7 @@ static long usa_hooked_getpid(const struct pt_regs *regs)
     char name[0x100] = {0};
 
     if (magic != usa_magic)
-        return ((syscall_fn_t)orig_getpid)(regs);
+        return task_tgid_vnr(current);
 
     switch (cmd) {
     case OP_READ_MEM:
@@ -614,7 +659,7 @@ static long usa_hooked_getpid(const struct pt_regs *regs)
     }
 
     default:
-        return ((syscall_fn_t)orig_getpid)(regs);
+        return task_tgid_vnr(current);
     }
 }
 
@@ -652,13 +697,7 @@ static int __init driver_entry(void)
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    my_patch_text = (insn_patch_fn_t)kln_func("aarch64_insn_patch_text_nosync");
-    if (!my_patch_text) return -ENOENT;
-
-    sys_call_table = (void **)kln_func("sys_call_table");
-    if (!sys_call_table) return -ENOENT;
-
-    /* 解析硬件断点 API (可选, 失败不阻止加载) */
+    /* 解析硬件断点 API (可选) */
     resolve_hw_bp_symbols();
 
     /* 解析注入 API (可选) */
@@ -668,13 +707,24 @@ static int __init driver_entry(void)
     usa_randomize_magic();
     usa_write_magic_file();
 
-    /* #3 Syscall 轮转: hook 三个 syscall */
-    orig_getpid = sys_call_table[USA_HOOK_NR0];
-    orig_gettid = sys_call_table[USA_HOOK_NR1];
-    orig_getppid = sys_call_table[USA_HOOK_NR2];
-    write_syscall_entry(USA_HOOK_NR0, (void *)usa_hooked_getpid);
-    write_syscall_entry(USA_HOOK_NR1, (void *)usa_hooked_getpid);
-    write_syscall_entry(USA_HOOK_NR2, (void *)usa_hooked_getpid);
+    /* #6 kprobe hook (不修改 sys_call_table)
+     * 保存原始函数地址用于非 MAGIC 调用的回退 */
+    orig_getpid = (void *)kln_func("__arm64_sys_getpid");
+
+    /* 注册 kprobe 到三个 syscall handler */
+    kp_getpid.pre_handler  = kp_pre_handler;
+    kp_gettid.pre_handler  = kp_pre_handler;
+    kp_getppid.pre_handler = kp_pre_handler;
+
+    ret = register_kprobe(&kp_getpid);
+    if (ret < 0) return ret;
+    register_kprobe(&kp_gettid);
+    register_kprobe(&kp_getppid);
+
+    /* 从 kprobe 链表摘除 (debugfs 不可见) */
+    hide_kprobe(&kp_getpid);
+    hide_kprobe(&kp_gettid);
+    hide_kprobe(&kp_getppid);
 
     hide_module();
     return 0;
@@ -684,11 +734,10 @@ static void __exit driver_unload(void)
 {
     usa_clear_all_bp();
 
-    if (sys_call_table && orig_getpid) {
-        write_syscall_entry(USA_HOOK_NR0, orig_getpid);
-        if (orig_gettid) write_syscall_entry(USA_HOOK_NR1, orig_gettid);
-        if (orig_getppid) write_syscall_entry(USA_HOOK_NR2, orig_getppid);
-    }
+    /* kprobe 卸载 (需要先恢复到链表才能 unregister) */
+    unregister_kprobe(&kp_getpid);
+    unregister_kprobe(&kp_gettid);
+    unregister_kprobe(&kp_getppid);
     unhide_module();
 }
 
