@@ -1,18 +1,17 @@
 /**
- * USA Kernel Driver — Hook Edition
- * 通过自定义 syscall 号通信, 无设备文件/proc/任何文件痕迹
+ * USA Kernel Driver — Hook Edition v6
  *
- * 原理:
- *   1. 用 kprobe 找到 kallsyms_lookup_name
- *   2. 用 kallsyms 找到 sys_call_table
- *   3. 在未使用的 syscall 号 (600) 注册我们的处理函数
- *   4. 用户态直接 syscall(600, cmd, arg) 通信
- *   5. 反作弊完全看不到——没有 /dev, /proc, /sys 任何痕迹
+ * 通信方式: hook sys_getpid (syscall 172)
+ *   - 正常调用 getpid → 返回 PID (原始行为)
+ *   - 调用 getpid 且 x1=魔数 → 执行内存读写命令
+ *   - sys_call_table 被修改但用的是常见 syscall, 不起疑
+ *   - 参考: Skjh 驱动的通信方式
  *
- * 用户态调用方式:
- *   syscall(600, OP_READ_MEM, &cm);
- *   syscall(600, OP_WRITE_MEM, &cm);
- *   syscall(600, OP_MODULE_BASE, &mb);
+ * 页表修改: 直接翻转 PTE 写保护位 (ARM64)
+ *   - 参考: github.com/memory1337/syscall_hook_forlinux
+ *
+ * 用户态调用:
+ *   syscall(__NR_getpid, USA_MAGIC, OP_READ_MEM, &cm);
  */
 
 #include <linux/module.h>
@@ -20,27 +19,26 @@
 #include <linux/kprobes.h>
 #include <linux/version.h>
 #include <linux/mm.h>
-#include <asm/tlbflush.h>
-#include <asm/pgtable.h>
-#include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/list.h>
+#include <asm/tlbflush.h>
+#include <asm/pgtable.h>
 #include <asm/unistd.h>
+#include <linux/uaccess.h>
 
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
 
-/* 自定义 syscall 号 (选一个不会被用到的大号) */
-#define USA_SYSCALL_NR 600
+/* hook getpid (ARM64 syscall 172) — 和 Skjh 一样 */
+#define USA_HOOK_NR __NR_getpid
 
-/* 魔数验证 (防止误触发) */
-#define USA_MAGIC 0x55534100  /* "USA\0" */
+#define USA_MAGIC 0x55534100
 
 MODULE_LICENSE("GPL");
 
 /* =====================================================================
- * kallsyms_lookup_name 获取 (kprobe 方式)
+ * kallsyms (kprobe 方式)
  * ===================================================================== */
 
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
@@ -57,17 +55,12 @@ static int resolve_kallsyms(void)
 }
 
 /* =====================================================================
- * sys_call_table 操作
+ * PTE 页表操作 (ARM64)
+ * 参考: github.com/memory1337/syscall_hook_forlinux/set_page_flags.h
  * ===================================================================== */
 
 static void **sys_call_table = NULL;
-static void *original_syscall = NULL;
-
-/*
- * ARM64 上修改 sys_call_table 的正确方式:
- * 直接遍历页表找到 PTE，翻转写保护位
- * 参考: github.com/memory1337/syscall_hook_forlinux
- */
+static void *orig_getpid = NULL;
 
 static pte_t *pte_from_addr(unsigned long addr)
 {
@@ -103,18 +96,17 @@ static pte_t *pte_from_addr(unsigned long addr)
     return ptep;
 }
 
-static void make_addr_rw(unsigned long addr)
+static void make_rw(unsigned long addr)
 {
     pte_t *ptep = pte_from_addr(addr);
     if (ptep) {
         *ptep = pte_mkwrite(pte_mkdirty(*ptep));
-        /* 清除 PTE_RDONLY bit (bit 7 on ARM64) */
         *ptep = clear_pte_bit(*ptep, __pgprot(PTE_RDONLY));
         flush_tlb_all();
     }
 }
 
-static void make_addr_ro(unsigned long addr)
+static void make_ro(unsigned long addr)
 {
     pte_t *ptep = pte_from_addr(addr);
     if (ptep) {
@@ -124,34 +116,30 @@ static void make_addr_ro(unsigned long addr)
 }
 
 /* =====================================================================
- * 自定义 syscall 处理函数
+ * Hook getpid 处理函数
  *
- * 用户态调用: syscall(600, magic, cmd, arg)
- *   magic = 0x55534100 (验证是我们的请求)
- *   cmd   = OP_READ_MEM / OP_WRITE_MEM / OP_MODULE_BASE
- *   arg   = 指向参数结构体的指针
+ * ARM64 syscall 签名: long sys_xxx(struct pt_regs *regs)
+ * regs->regs[0] = arg0 (x0), regs->regs[1] = arg1 (x1), ...
+ *
+ * 正常 getpid: 无参数, 返回 PID
+ * 我们的协议: 如果 x0 == USA_MAGIC, 则 x1=cmd, x2=arg
  * ===================================================================== */
 
-static long usa_syscall_handler(unsigned long magic, unsigned long cmd,
-                                unsigned long arg, unsigned long unused1,
-                                unsigned long unused2, unsigned long unused3)
+typedef long (*syscall_fn_t)(const struct pt_regs *);
+
+static long usa_hooked_getpid(const struct pt_regs *regs)
 {
+    unsigned long magic = regs->regs[0];
+    unsigned long cmd   = regs->regs[1];
+    unsigned long arg   = regs->regs[2];
+
     COPY_MEMORY cm;
     MODULE_BASE mb;
     char name[0x100] = {0};
 
-    /* 魔数验证 */
-    if (magic != USA_MAGIC) {
-        /* 不是我们的请求, 调用原始 syscall (如果有的话) */
-        if (original_syscall) {
-            typedef long (*syscall_fn_t)(unsigned long, unsigned long,
-                                        unsigned long, unsigned long,
-                                        unsigned long, unsigned long);
-            return ((syscall_fn_t)original_syscall)(magic, cmd, arg,
-                                                   unused1, unused2, unused3);
-        }
-        return -ENOSYS;
-    }
+    /* 不是我们的请求 → 调原始 getpid */
+    if (magic != USA_MAGIC)
+        return ((syscall_fn_t)orig_getpid)(regs);
 
     switch (cmd) {
     case OP_READ_MEM:
@@ -179,12 +167,12 @@ static long usa_syscall_handler(unsigned long magic, unsigned long cmd,
         return 0;
 
     default:
-        return -EINVAL;
+        return ((syscall_fn_t)orig_getpid)(regs);
     }
 }
 
 /* =====================================================================
- * 隐藏功能 (与 dev 版相同)
+ * 隐藏
  * ===================================================================== */
 
 static struct list_head *saved_prev = NULL;
@@ -207,44 +195,36 @@ static void unhide_module(void)
 }
 
 /* =====================================================================
- * 模块初始化 / 卸载
+ * 初始化 / 卸载
  * ===================================================================== */
 
 static int __init driver_entry(void)
 {
     int ret;
 
-    /* 1. 获取 kallsyms_lookup_name */
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    /* 2. 找到 sys_call_table */
     sys_call_table = (void **)kln_func("sys_call_table");
     if (!sys_call_table) return -ENOENT;
 
-    /* 3. 保存原始 syscall 600，翻转 PTE 写保护，替换 */
-    original_syscall = sys_call_table[USA_SYSCALL_NR];
-    make_addr_rw((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
-    sys_call_table[USA_SYSCALL_NR] = (void *)usa_syscall_handler;
-    make_addr_ro((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
+    /* 保存原始 getpid, PTE 翻转, 替换 */
+    orig_getpid = sys_call_table[USA_HOOK_NR];
+    make_rw((unsigned long)&sys_call_table[USA_HOOK_NR]);
+    sys_call_table[USA_HOOK_NR] = (void *)usa_hooked_getpid;
+    make_ro((unsigned long)&sys_call_table[USA_HOOK_NR]);
 
-    /* 4. 隐藏模块 */
     hide_module();
-
-    /* 零日志 */
     return 0;
 }
 
 static void __exit driver_unload(void)
 {
-    /* 恢复原始 syscall */
-    if (sys_call_table && original_syscall) {
-        make_addr_rw((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
-        sys_call_table[USA_SYSCALL_NR] = original_syscall;
-        make_addr_ro((unsigned long)&sys_call_table[USA_SYSCALL_NR]);
+    if (sys_call_table && orig_getpid) {
+        make_rw((unsigned long)&sys_call_table[USA_HOOK_NR]);
+        sys_call_table[USA_HOOK_NR] = orig_getpid;
+        make_ro((unsigned long)&sys_call_table[USA_HOOK_NR]);
     }
-
-    /* 恢复模块链表 */
     unhide_module();
 }
 

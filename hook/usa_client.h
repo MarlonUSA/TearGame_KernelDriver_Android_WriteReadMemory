@@ -18,7 +18,8 @@
 #include <string.h>
 #include <stdint.h>
 
-#define USA_SYSCALL_NR 600
+/* hook getpid — 用已有的 syscall, 和正常 getpid 调用混在一起不起疑 */
+#define USA_SYSCALL_NR __NR_getpid  /* 172 on arm64 */
 #define USA_MAGIC      0x55534100
 
 /* 命令号 (与 comm.h 一致) */
