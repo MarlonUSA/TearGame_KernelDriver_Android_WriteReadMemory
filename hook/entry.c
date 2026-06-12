@@ -419,7 +419,7 @@ static int usa_hide_process(pid_t target_pid)
 }
 
 /* #5 直接页表读写 (绕过 access_process_vm 内核 API 痕迹) */
-static int usa_read_phys(pid_t target_pid, uintptr_t vaddr, void __user *ubuf, size_t size)
+static int __maybe_unused usa_read_phys(pid_t target_pid, uintptr_t vaddr, void __user *ubuf, size_t size)
 {
     struct task_struct *task;
     struct mm_struct *mm;
