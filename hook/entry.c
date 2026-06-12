@@ -109,28 +109,29 @@ static int resolve_kallsyms(void)
 
 static void *orig_getpid = NULL; /* 保存原始函数地址用于回调 */
 
-/* kprobe 实例 (每个 syscall 一个) */
-static struct kprobe kp_getpid  = { .symbol_name = "__arm64_sys_getpid" };
-static struct kprobe kp_gettid  = { .symbol_name = "__arm64_sys_gettid" };
-static struct kprobe kp_getppid = { .symbol_name = "__arm64_sys_getppid" };
-
 /* 前向声明 */
 static long usa_hooked_getpid(const struct pt_regs *regs);
 
-/* kprobe pre_handler: 在 syscall 执行前拦截
+/* ====== kretprobe: 在 syscall 返回时拦截 ======
  *
- * ARM64 syscall 调用链:
- *   el0_svc → invoke_syscall → __arm64_sys_getpid(regs)
- *   regs->regs[0] 是指向用户态 pt_regs 的指针
- *   __arm64_sys_getpid 内部读 user_regs->regs[0] 获取用户态 x0
+ * pre_handler: 检查 MAGIC, 命中则处理命令, 把结果存到 data
+ * ret_handler: 用存的结果覆盖返回值
  *
- * 策略: 在 pre_handler 中检查用户态 x0 是否是 MAGIC
- *        如果是, 处理命令, 然后修改 regs 让原函数跳过 (pc = lr)
+ * 优点: 不需要跳过原函数, ARM64 完全兼容
  */
-static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+
+struct usa_kret_data {
+    long result;
+    int handled;
+};
+
+static int kret_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct usa_kret_data *data = (struct usa_kret_data *)ri->data;
     struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
     unsigned long magic;
+
+    data->handled = 0;
 
     if (!user_regs)
         return 0;
@@ -142,27 +143,51 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
         return 0;
 
     /* 是我们的命令 */
-    {
-        long ret = usa_hooked_getpid(user_regs);
-
-        /* 修改返回值: 原函数返回 x0, 我们直接设 */
-        regs->regs[0] = (unsigned long)ret;
-
-        /* 跳过原函数: 设 PC = LR, 直接返回调用者 */
-        regs->pc = regs->regs[30];
-    }
-
-    return 1; /* 返回 1 = 不再执行被探测的指令 */
+    data->result = usa_hooked_getpid(user_regs);
+    data->handled = 1;
+    return 0;
 }
 
-/* 从 kprobe 内部链表摘除 (debugfs/kprobes/list 不可见) */
-static void hide_kprobe(struct kprobe *kp)
+static int kret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    /* kprobe 注册后在 kprobe_table hash 中
-     * 摘除后 /sys/kernel/debug/kprobes/list 看不到 */
-    if (kp->hlist.pprev) {
-        hlist_del_rcu(&kp->hlist);
-        kp->hlist.pprev = NULL;
+    struct usa_kret_data *data = (struct usa_kret_data *)ri->data;
+    if (data->handled) {
+        /* 覆盖返回值 */
+        regs_return_value(regs) = data->result;
+    }
+    return 0;
+}
+
+static struct kretprobe krp_getpid = {
+    .kp.symbol_name = "__arm64_sys_getpid",
+    .handler = kret_handler,
+    .entry_handler = kret_entry,
+    .data_size = sizeof(struct usa_kret_data),
+    .maxactive = 20,
+};
+
+static struct kretprobe krp_gettid = {
+    .kp.symbol_name = "__arm64_sys_gettid",
+    .handler = kret_handler,
+    .entry_handler = kret_entry,
+    .data_size = sizeof(struct usa_kret_data),
+    .maxactive = 20,
+};
+
+static struct kretprobe krp_getppid = {
+    .kp.symbol_name = "__arm64_sys_getppid",
+    .handler = kret_handler,
+    .entry_handler = kret_entry,
+    .data_size = sizeof(struct usa_kret_data),
+    .maxactive = 20,
+};
+
+/* 从 kprobe 内部链表摘除 */
+static void hide_kretprobe(struct kretprobe *rp)
+{
+    if (rp->kp.hlist.pprev) {
+        hlist_del_rcu(&rp->kp.hlist);
+        rp->kp.hlist.pprev = NULL;
     }
 }
 
@@ -707,24 +732,16 @@ static int __init driver_entry(void)
     usa_randomize_magic();
     usa_write_magic_file();
 
-    /* #6 kprobe hook (不修改 sys_call_table)
-     * 保存原始函数地址用于非 MAGIC 调用的回退 */
-    orig_getpid = (void *)kln_func("__arm64_sys_getpid");
-
-    /* 注册 kprobe 到三个 syscall handler */
-    kp_getpid.pre_handler  = kp_pre_handler;
-    kp_gettid.pre_handler  = kp_pre_handler;
-    kp_getppid.pre_handler = kp_pre_handler;
-
-    ret = register_kprobe(&kp_getpid);
+    /* #6 kretprobe hook (不修改 sys_call_table) */
+    ret = register_kretprobe(&krp_getpid);
     if (ret < 0) return ret;
-    register_kprobe(&kp_gettid);
-    register_kprobe(&kp_getppid);
+    register_kretprobe(&krp_gettid);
+    register_kretprobe(&krp_getppid);
 
-    /* 从 kprobe 链表摘除 (debugfs 不可见) */
-    hide_kprobe(&kp_getpid);
-    hide_kprobe(&kp_gettid);
-    hide_kprobe(&kp_getppid);
+    /* 从 kprobe 链表摘除 */
+    hide_kretprobe(&krp_getpid);
+    hide_kretprobe(&krp_gettid);
+    hide_kretprobe(&krp_getppid);
 
     hide_module();
     return 0;
@@ -735,9 +752,9 @@ static void __exit driver_unload(void)
     usa_clear_all_bp();
 
     /* kprobe 卸载 (需要先恢复到链表才能 unregister) */
-    unregister_kprobe(&kp_getpid);
-    unregister_kprobe(&kp_gettid);
-    unregister_kprobe(&kp_getppid);
+    unregister_kretprobe(&krp_getpid);
+    unregister_kretprobe(&krp_gettid);
+    unregister_kretprobe(&krp_getppid);
     unhide_module();
 }
 
