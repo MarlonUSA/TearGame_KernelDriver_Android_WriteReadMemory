@@ -153,7 +153,7 @@ static int kret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct usa_kret_data *data = (struct usa_kret_data *)ri->data;
     if (data->handled) {
         /* 覆盖返回值 */
-        regs_return_value(regs) = data->result;
+        regs->regs[0] = data->result;
     }
     return 0;
 }
