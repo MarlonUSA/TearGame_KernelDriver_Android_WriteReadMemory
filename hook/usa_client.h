@@ -103,18 +103,22 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
     if (!_usa_shm) return -ENODEV;
     pthread_mutex_lock(&_usa_mtx);
 
+    /* 先写所有字段 (这些写入不在 watchpoint 监视范围内) */
     _usa_shm->magic  = _usa_magic;
     _usa_shm->cmd    = cmd;
     _usa_shm->pid    = pid;
     _usa_shm->addr   = addr;
     _usa_shm->size   = size;
     _usa_shm->result = 0;
+
+    /* 最后写 state = PENDING
+     * 这一行写入触发 HW Write Watchpoint
+     * → 内核 comm_bp_handler 立刻执行 (在 overlay 线程上下文)
+     * → 处理完毕, 写 state = DONE
+     * → 这次写返回时, state 已经是 DONE */
     __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
 
-    /* 触发 kprobe: getpid 进入内核, 我们的 handler 读 comm_addr */
-    syscall(__NR_getpid);
-
-    /* kprobe 同步执行完, 检查结果 */
+    /* HW watchpoint handler 同步执行完了, 检查结果 */
     if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
         result = _usa_shm->result;
         __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
@@ -122,16 +126,15 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
         return result;
     }
 
-    /* 备用重试 (不应该到这) */
-    for (retries = 0; retries < 100; retries++) {
-        syscall(__NR_getpid);
+    /* 备用轮询 (handler 应该是同步的, 这里几乎用不到) */
+    for (retries = 0; retries < 1000; retries++) {
         if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
             result = _usa_shm->result;
             __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
             pthread_mutex_unlock(&_usa_mtx);
             return result;
         }
-        usleep(100);
+        usleep(10);
     }
 
     __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);

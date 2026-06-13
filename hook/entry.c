@@ -1,10 +1,12 @@
 /**
- * USA Kernel Driver v15 — 完整复刻 SKJH 架构
+ * USA Kernel Driver v16 — 真正的 SKJH 架构
  *
- * 通信: kprobe pre_handler on __arm64_sys_getpid + comm_pid 过滤 + comm_addr 共享内存
- * 读写: 页表遍历 (无锁, 原子上下文安全)
- * 注入: UXN 页表陷阱 + HW 执行断点 (SKJH Shoot 系统)
- * 隐藏: 摘 kprobe 链表 + 摘模块链表 + 删 /sys/module
+ * 通信: HW Write Watchpoint on overlay 的 comm_addr (per-task, 不动 syscall)
+ * 注入: HW Execution Breakpoint + UXN (Shoot)
+ * 读写: 页表遍历 (atomic context 安全)
+ * 隐藏: 模块摘链表
+ *
+ * 核心: 模块加载后没有任何 kprobe 残留
  */
 
 #include <linux/module.h>
@@ -20,9 +22,9 @@
 #include <uapi/asm-generic/mman-common.h>
 #include <linux/highmem.h>
 #include <linux/pid.h>
-#include <linux/uaccess.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
+#include <linux/workqueue.h>
 #include <linux/kernfs.h>
 #include <linux/pgtable.h>
 #include <asm/unistd.h>
@@ -48,10 +50,12 @@ MODULE_PARM_DESC(comm_addr, "Overlay user-space comm buffer address");
 
 static unsigned long usa_magic = 0x55534100;
 module_param(usa_magic, ulong, 0);
-MODULE_PARM_DESC(usa_magic, "Communication MAGIC value");
+MODULE_PARM_DESC(usa_magic, "Communication MAGIC");
 
 /* =====================================================================
- * 通信协议: overlay 用户态共享页结构 (4KB, mlock 锁定)
+ * 共享内存结构 (overlay 用户态分配, 内核通过 HW watchpoint 监视触发)
+ *
+ * overlay 写 state 字段 → 触发 HW write watchpoint → 内核处理
  * ===================================================================== */
 
 #define SHM_STATE_IDLE    0
@@ -59,7 +63,7 @@ MODULE_PARM_DESC(usa_magic, "Communication MAGIC value");
 #define SHM_STATE_DONE    2
 
 struct usa_shm {
-    volatile uint32_t state;
+    volatile uint32_t state;    /* 4 字节, HW watchpoint 监视此字段 */
     uint32_t magic;
     uint32_t cmd;
     int32_t  pid;
@@ -71,7 +75,7 @@ struct usa_shm {
 };
 
 /* =====================================================================
- * kallsyms 解析
+ * kallsyms 解析 (init 时一次, 用完 unregister)
  * ===================================================================== */
 
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
@@ -83,12 +87,12 @@ static int resolve_kallsyms(void)
     int ret = register_kprobe(&kp);
     if (ret < 0) return ret;
     kln_func = (kallsyms_lookup_name_t)kp.addr;
-    unregister_kprobe(&kp);
+    unregister_kprobe(&kp);  /* 立即注销, 之后系统里无 kprobe 残留 */
     return kln_func ? 0 : -EFAULT;
 }
 
 /* =====================================================================
- * 内核符号解析 (GKI 未导出, 用 kallsyms)
+ * 内核符号解析
  * ===================================================================== */
 
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
@@ -108,7 +112,7 @@ typedef void (*unregister_hw_breakpoint_t)(struct perf_event *);
 static register_user_hw_breakpoint_t fn_register_user_hw_breakpoint;
 static unregister_hw_breakpoint_t fn_unregister_hw_breakpoint;
 
-typedef void (*kernfs_remove_t)(struct kernfs_node *kn);
+typedef void (*kernfs_remove_t)(struct kernfs_node *);
 static kernfs_remove_t fn_kernfs_remove;
 
 static int resolve_symbols(void)
@@ -123,11 +127,11 @@ static int resolve_symbols(void)
     fn_register_user_hw_breakpoint = (register_user_hw_breakpoint_t)kln_func("register_user_hw_breakpoint");
     fn_unregister_hw_breakpoint = (unregister_hw_breakpoint_t)kln_func("unregister_hw_breakpoint");
     fn_kernfs_remove = (kernfs_remove_t)kln_func("kernfs_remove");
-    return fn_find_task_by_vpid ? 0 : -ENOENT;
+    return fn_find_task_by_vpid && fn_register_user_hw_breakpoint ? 0 : -ENOENT;
 }
 
 /* =====================================================================
- * 页表 PTE 操作 (用户页 UXN 控制)
+ * 页表 PTE 操作 (Shoot 注入用 UXN)
  * ===================================================================== */
 
 static pte_t *get_user_ptep(struct mm_struct *mm, unsigned long addr)
@@ -144,8 +148,7 @@ static pte_t *get_user_ptep(struct mm_struct *mm, unsigned long addr)
     return pte_offset_kernel(pmd, addr);
 }
 
-/* ARM64 PTE bit 54 = UXN (User eXecute Never) */
-#define PTE_UXN_BIT  (1ULL << 54)
+#define PTE_UXN_BIT (1ULL << 54)
 
 static void set_pte_uxn(pte_t *ptep, unsigned long addr)
 {
@@ -162,23 +165,9 @@ static void clear_pte_uxn(pte_t *ptep, unsigned long addr)
 }
 
 /* =====================================================================
- * Shoot 注入系统 — UXN 页表陷阱 + HW 执行断点
+ * Shoot 注入系统 (HW exec BP, 一次性)
  * ===================================================================== */
 
-/*
- * ARM64 dlopen shellcode (PIC, 36 bytes + 16B 元数据 + path)
- * Layout: [code 36B] [orig_pc 8B] [dlopen_addr 8B] [path string]
- *
- * STP X29, X30, [SP, #-16]!     ; save frame
- * MOV X29, SP
- * ADR X0, path                  ; X0 = &path (+40 from here)
- * MOV X1, #2                    ; RTLD_NOW
- * LDR X16, [X0, #-8]            ; dlopen_addr
- * BLR X16                       ; dlopen(path, RTLD_NOW)
- * LDP X29, X30, [SP], #16       ; restore frame
- * LDR X16, [X0, #-16]           ; orig_pc
- * BR  X16                       ; jump back
- */
 static const uint32_t shoot_shellcode[] = {
     0xA9BF7BFD, 0x910003FD, 0x10000140, 0xD2800041,
     0xF85F8010, 0xD63F0200, 0xA8C17BFD, 0xF8500010,
@@ -189,7 +178,7 @@ static const uint32_t shoot_shellcode[] = {
 #define SHOOT_DLOPEN_OFF 44
 #define SHOOT_PATH_OFF   52
 
-#define MAX_SHOOT_SLOTS  4
+#define MAX_SHOOT_SLOTS 4
 static struct {
     int active;
     pid_t target_pid;
@@ -201,7 +190,6 @@ static struct {
 
 static DEFINE_SPINLOCK(shoot_lock);
 
-/* HW BP handler: 游戏线程命中 → 改 PC 跳到 shellcode */
 static void shoot_bp_handler(struct perf_event *bp,
                              struct perf_sample_data *data,
                              struct pt_regs *regs)
@@ -212,12 +200,9 @@ static void shoot_bp_handler(struct perf_event *bp,
     spin_lock_irqsave(&shoot_lock, flags);
     for (i = 0; i < MAX_SHOOT_SLOTS; i++) {
         if (shoot_slots[i].active && shoot_slots[i].bp_event == bp) {
-            /* 改 PC, 让游戏线程跳到 shellcode */
             regs->pc = shoot_slots[i].shellcode_addr;
-            /* 恢复 UXN 让该页可执行 (shellcode 末尾跳回时不再 fault) */
             if (shoot_slots[i].trap_ptep)
                 clear_pte_uxn(shoot_slots[i].trap_ptep, shoot_slots[i].trap_addr);
-            /* 标记完成 */
             shoot_slots[i].active = 0;
             break;
         }
@@ -225,27 +210,7 @@ static void shoot_bp_handler(struct perf_event *bp,
     spin_unlock_irqrestore(&shoot_lock, flags);
 }
 
-static int find_free_shoot_slot(void)
-{
-    int i;
-    for (i = 0; i < MAX_SHOOT_SLOTS; i++)
-        if (!shoot_slots[i].active) return i;
-    return -1;
-}
-
-/*
- * Shoot 注入: 必须在 kthread 上下文执行 (因为要 use_mm + vm_mmap)
- * kprobe 上下文不能调用, 所以从命令处理派发到 workqueue
- */
-struct shoot_work {
-    struct work_struct work;
-    pid_t target_pid;
-    char so_path[256];
-    unsigned long dlopen_addr;
-    int64_t *result_ptr;
-    struct completion done;
-};
-
+/* 在 workqueue 中执行 (vm_mmap 需要 sleep) */
 static int do_shoot_inject(pid_t target_pid, const char *so_path,
                            unsigned long dlopen_addr)
 {
@@ -260,9 +225,7 @@ static int do_shoot_inject(pid_t target_pid, const char *so_path,
     int slot;
     unsigned long flags;
 
-    if (!fn_find_task_by_vpid || !fn_vm_mmap || !fn_use_mm || !fn_unuse_mm)
-        return -ENOSYS;
-    if (!fn_register_user_hw_breakpoint) return -ENOSYS;
+    if (!fn_vm_mmap || !fn_use_mm || !fn_unuse_mm) return -ENOSYS;
     if (!dlopen_addr) return -EINVAL;
 
     rcu_read_lock();
@@ -274,7 +237,6 @@ static int do_shoot_inject(pid_t target_pid, const char *so_path,
     mm = task->mm;
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    /* 1. 在目标进程 mmap RWX 页 */
     mmget(mm);
     fn_use_mm(mm);
     remote_page = fn_vm_mmap(NULL, 0, 4096,
@@ -284,19 +246,15 @@ static int do_shoot_inject(pid_t target_pid, const char *so_path,
     mmput(mm);
 
     if (IS_ERR_VALUE(remote_page)) {
-        long err = (long)remote_page;
-        pr_info("usa_hook: vm_mmap failed err=%ld\n", err);
         put_task_struct(task);
-        return (int)err;
+        return (int)(long)remote_page;
     }
 
-    /* 2. 选游戏代码页设 UXN 陷阱 */
     code_addr = get_module_base(target_pid, "libUE4.so");
     if (!code_addr) code_addr = get_module_base(target_pid, "linker64");
     if (!code_addr) { put_task_struct(task); return -ENODATA; }
-    code_addr += 0x1000;  /* 跳过 ELF header, 进入代码段 */
+    code_addr += 0x1000;
 
-    /* 3. 构建 shellcode */
     total_size = SHOOT_PATH_OFF + strlen(so_path) + 1;
     memset(buf, 0, sizeof(buf));
     memcpy(buf, shoot_shellcode, SHOOT_CODE_SIZE);
@@ -305,37 +263,25 @@ static int do_shoot_inject(pid_t target_pid, const char *so_path,
     memcpy(buf + SHOOT_PATH_OFF, so_path, strlen(so_path) + 1);
 
     if (!write_process_memory(target_pid, remote_page, buf, total_size)) {
-        pr_info("usa_hook: write shellcode failed\n");
         put_task_struct(task);
         return -EIO;
     }
 
-    /* 4. 获取代码页 PTE */
     ptep = get_user_ptep(mm, code_addr);
-    if (!ptep) {
-        pr_info("usa_hook: get_user_ptep failed for 0x%lx\n", code_addr);
-        put_task_struct(task);
-        return -EFAULT;
-    }
+    if (!ptep) { put_task_struct(task); return -EFAULT; }
 
-    /* 5. 注册 HW 执行断点 (在 trap_addr, 任意线程执行到此触发) */
     hw_breakpoint_init(&attr);
     attr.bp_addr = code_addr;
     attr.bp_len = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
 
     bp = fn_register_user_hw_breakpoint(&attr, shoot_bp_handler, NULL, task);
-    if (IS_ERR(bp)) {
-        long err = PTR_ERR(bp);
-        pr_info("usa_hook: register_user_hw_breakpoint failed %ld\n", err);
-        put_task_struct(task);
-        return (int)err;
-    }
+    if (IS_ERR(bp)) { put_task_struct(task); return (int)PTR_ERR(bp); }
 
-    /* 6. 存到 shoot_slot */
     spin_lock_irqsave(&shoot_lock, flags);
-    slot = find_free_shoot_slot();
-    if (slot < 0) {
+    for (slot = 0; slot < MAX_SHOOT_SLOTS; slot++)
+        if (!shoot_slots[slot].active) break;
+    if (slot >= MAX_SHOOT_SLOTS) {
         spin_unlock_irqrestore(&shoot_lock, flags);
         fn_unregister_hw_breakpoint(bp);
         put_task_struct(task);
@@ -349,38 +295,37 @@ static int do_shoot_inject(pid_t target_pid, const char *so_path,
     shoot_slots[slot].bp_event = bp;
     spin_unlock_irqrestore(&shoot_lock, flags);
 
-    /* 7. 设 UXN, 让游戏执行到 code_addr 触发 fault → HW BP handler 改 PC */
     set_pte_uxn(ptep, code_addr);
-
     put_task_struct(task);
     return 0;
 }
 
-/* workqueue 中的 inject 执行 */
+/* Shoot 工作队列 */
+struct shoot_work {
+    struct work_struct work;
+    pid_t target_pid;
+    char so_path[256];
+    unsigned long dlopen_addr;
+};
+
 static void shoot_work_fn(struct work_struct *w)
 {
     struct shoot_work *sw = container_of(w, struct shoot_work, work);
-    *sw->result_ptr = do_shoot_inject(sw->target_pid, sw->so_path, sw->dlopen_addr);
-    complete(&sw->done);
+    do_shoot_inject(sw->target_pid, sw->so_path, sw->dlopen_addr);
+    kfree(sw);
 }
 
-/* 入口: 从 kprobe handler 调用, 派发到 workqueue 等待完成 */
 static int queue_shoot_inject(pid_t pid, const char *so_path, unsigned long dlopen_addr)
 {
-    struct shoot_work sw;
-    int64_t result = -EAGAIN;
-
-    INIT_WORK(&sw.work, shoot_work_fn);
-    sw.target_pid = pid;
-    strncpy(sw.so_path, so_path, sizeof(sw.so_path) - 1);
-    sw.so_path[sizeof(sw.so_path) - 1] = 0;
-    sw.dlopen_addr = dlopen_addr;
-    sw.result_ptr = &result;
-    init_completion(&sw.done);
-
-    schedule_work(&sw.work);
-    /* 不能在 kprobe 原子上下文等待, 返回 -EAGAIN 让 overlay 重试查询结果 */
-    return -EAGAIN;
+    struct shoot_work *sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
+    if (!sw) return -ENOMEM;
+    INIT_WORK(&sw->work, shoot_work_fn);
+    sw->target_pid = pid;
+    strncpy(sw->so_path, so_path, sizeof(sw->so_path) - 1);
+    sw->so_path[sizeof(sw->so_path) - 1] = 0;
+    sw->dlopen_addr = dlopen_addr;
+    schedule_work(&sw->work);
+    return 0;  /* 异步派发, 立即返回 */
 }
 
 /* =====================================================================
@@ -394,7 +339,6 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
     struct vm_area_struct *vma;
     unsigned long addr;
 
-    if (!fn_find_task_by_vpid) return -ENOENT;
     rcu_read_lock();
     task = fn_find_task_by_vpid(target_pid);
     if (task) get_task_struct(task);
@@ -416,13 +360,12 @@ static int usa_hide_maps(pid_t target_pid, const char *lib_name)
             }
         }
     }
-
     put_task_struct(task);
     return 0;
 }
 
 /* =====================================================================
- * 命令处理 (在 kprobe 原子上下文执行)
+ * 通信命令处理 (在 HW watchpoint handler 中调用)
  * ===================================================================== */
 
 static void process_command(struct usa_shm *shm)
@@ -448,7 +391,6 @@ static void process_command(struct usa_shm *shm)
         break;
 
     case OP_INJECT_SO:
-        /* 异步: workqueue 处理. 用户态需要轮询 result */
         shm->result = queue_shoot_inject(pid, shm->name, (unsigned long)addr);
         break;
 
@@ -463,52 +405,74 @@ static void process_command(struct usa_shm *shm)
 }
 
 /* =====================================================================
- * kprobe pre_handler on __arm64_sys_getpid
+ * 通信 HW Watchpoint Handler
  *
- * 99.99% 调用: PID 不匹配, 立刻 return 0
- * 只有 overlay 进程调用时, 进入命令处理
+ * overlay 写 shm->state = PENDING 时触发
+ * current == overlay 的线程 (HW BP scoped to comm_pid task)
  * ===================================================================== */
 
-static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+static struct perf_event *comm_bp;
+
+static void comm_bp_handler(struct perf_event *bp,
+                            struct perf_sample_data *data,
+                            struct pt_regs *regs)
 {
-    struct usa_shm *shm;
+    struct usa_shm *shm = (struct usa_shm *)comm_addr;
     uint32_t state;
 
-    /* 1. PID 过滤 (秒退) */
-    if (current->tgid != comm_pid)
-        return 0;
+    if (!comm_addr) return;
 
-    /* 2. comm_addr 必须设置 */
-    if (!comm_addr)
-        return 0;
-
-    /* 3. 直接读 overlay 用户内存 (current == overlay, mm 可达)
-     *    overlay 已 mlock 该页, 不会 page fault */
-    shm = (struct usa_shm *)comm_addr;
-
-    /* 4. 检查状态 */
+    /* current 是 overlay (HW BP scoped). 直接读 user 内存
+     * 此时 overlay 刚写完 state, 页一定在 TLB 里 */
     state = READ_ONCE(shm->state);
-    if (state != SHM_STATE_PENDING)
-        return 0;
+    if (state != SHM_STATE_PENDING) return;
 
-    /* 5. MAGIC 验证 */
-    if (shm->magic != (uint32_t)(usa_magic & 0xFFFFFFFF))
-        return 0;
+    if (shm->magic != (uint32_t)(usa_magic & 0xFFFFFFFF)) return;
 
-    /* 6. 处理命令 */
     smp_rmb();
     process_command(shm);
     smp_wmb();
 
-    /* 7. 标记完成 */
     WRITE_ONCE(shm->state, SHM_STATE_DONE);
-    return 0;
 }
 
-static struct kprobe kp_getpid = {
-    .symbol_name = "__arm64_sys_getpid",
-    .pre_handler = kp_pre_handler,
-};
+static int register_comm_watchpoint(void)
+{
+    struct task_struct *task;
+    struct perf_event_attr attr;
+    struct perf_event *bp;
+
+    if (comm_pid < 0 || !comm_addr) {
+        pr_info("usa_hook: invalid comm_pid=%d or comm_addr=0x%lx\n",
+                comm_pid, comm_addr);
+        return -EINVAL;
+    }
+
+    rcu_read_lock();
+    task = fn_find_task_by_vpid(comm_pid);
+    if (task) get_task_struct(task);
+    rcu_read_unlock();
+    if (!task) {
+        pr_info("usa_hook: overlay task pid=%d not found\n", comm_pid);
+        return -ESRCH;
+    }
+
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = comm_addr;            /* overlay 用户内存地址 */
+    attr.bp_len  = HW_BREAKPOINT_LEN_4;  /* 监视 4 字节 (state 字段) */
+    attr.bp_type = HW_BREAKPOINT_W;      /* 写触发 */
+
+    bp = fn_register_user_hw_breakpoint(&attr, comm_bp_handler, NULL, task);
+    put_task_struct(task);
+
+    if (IS_ERR(bp)) {
+        pr_info("usa_hook: register HW watchpoint failed %ld\n", PTR_ERR(bp));
+        return (int)PTR_ERR(bp);
+    }
+
+    comm_bp = bp;
+    return 0;
+}
 
 /* =====================================================================
  * 隐藏
@@ -516,14 +480,6 @@ static struct kprobe kp_getpid = {
 
 static struct list_head *saved_prev;
 static int module_hidden;
-
-static void hide_kprobe_from_list(struct kprobe *kp)
-{
-    if (kp->hlist.pprev) {
-        hlist_del_rcu(&kp->hlist);
-        kp->hlist.pprev = NULL;
-    }
-}
 
 static void hide_module(void)
 {
@@ -562,22 +518,25 @@ static int __init driver_entry(void)
     ret = resolve_kallsyms();
     if (ret) return ret;
 
-    resolve_symbols();
-
-    /* 注册 kprobe on getpid */
-    ret = register_kprobe(&kp_getpid);
-    if (ret < 0) {
-        pr_info("usa_hook: register_kprobe failed %d\n", ret);
+    ret = resolve_symbols();
+    if (ret) {
+        pr_info("usa_hook: resolve_symbols failed %d\n", ret);
         return ret;
     }
 
-    /* 摘 kprobe 链表 (从 debugfs 不可见) */
-    hide_kprobe_from_list(&kp_getpid);
+    /* 注册通信 HW watchpoint */
+    ret = register_comm_watchpoint();
+    if (ret) {
+        pr_info("usa_hook: register_comm_watchpoint failed %d\n", ret);
+        return ret;
+    }
 
     /* 隐藏模块 */
     hide_module();
 
     memset(shoot_slots, 0, sizeof(shoot_slots));
+    pr_info("usa_hook: loaded, comm_pid=%d comm_addr=0x%lx\n",
+            comm_pid, comm_addr);
     return 0;
 }
 
@@ -585,7 +544,7 @@ static void __exit driver_unload(void)
 {
     int i;
 
-    /* 清理所有 Shoot */
+    /* 注销 Shoot HW BPs */
     for (i = 0; i < MAX_SHOOT_SLOTS; i++) {
         if (shoot_slots[i].bp_event && fn_unregister_hw_breakpoint) {
             fn_unregister_hw_breakpoint(shoot_slots[i].bp_event);
@@ -593,7 +552,12 @@ static void __exit driver_unload(void)
         }
     }
 
-    unregister_kprobe(&kp_getpid);
+    /* 注销通信 HW BP */
+    if (comm_bp && fn_unregister_hw_breakpoint) {
+        fn_unregister_hw_breakpoint(comm_bp);
+        comm_bp = NULL;
+    }
+
     unhide_module();
 }
 
