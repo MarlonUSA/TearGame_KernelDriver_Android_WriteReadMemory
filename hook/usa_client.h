@@ -108,7 +108,7 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
     __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
 
     /* getpid() 触发 kprobe → 内核在 pre_handler 里处理命令 */
-    syscall(__NR_getpid);
+    syscall(__NR_ioprio_get, 0, 0);
 
     /* kprobe pre_handler 同步执行完毕, 检查结果 */
     if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
@@ -120,7 +120,7 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
 
     /* 备用: 等几次 (不应该到这里, pre_handler 是同步的) */
     for (retries = 0; retries < 100; retries++) {
-        syscall(__NR_getpid);
+        syscall(__NR_ioprio_get, 0, 0);
         if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
             result = _usa_shm->result;
             __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
@@ -189,7 +189,7 @@ static inline int usa_inject_so(int pid, const char *path, unsigned long dlopen_
     __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
 
     /* 触发 kprobe */
-    syscall(__NR_getpid);
+    syscall(__NR_ioprio_get, 0, 0);
 
     /* Shoot 注入是异步的 (等游戏线程触发 UXN 陷阱)
      * 但 vm_mmap + shellcode 写入是同步的 */
@@ -197,7 +197,7 @@ static inline int usa_inject_so(int pid, const char *path, unsigned long dlopen_
     for (retries = 0; retries < 1000; retries++) {
         if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE)
             break;
-        syscall(__NR_getpid);
+        syscall(__NR_ioprio_get, 0, 0);
         usleep(100);
     }
 

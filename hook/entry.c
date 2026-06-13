@@ -157,6 +157,8 @@ static int resolve_symbols(void)
     fn_flush_tlb_page = (flush_tlb_page_fn_t)kln_func("flush_tlb_page");
     fn_register_user_hw_breakpoint = (register_user_hw_breakpoint_t)kln_func("register_user_hw_breakpoint");
     fn_unregister_hw_breakpoint = (unregister_hw_breakpoint_t)kln_func("unregister_hw_breakpoint");
+    fn_register_wide_hw_breakpoint = (register_wide_hw_breakpoint_t)kln_func("register_wide_hw_breakpoint");
+    fn_unregister_wide_hw_breakpoint = (unregister_wide_hw_breakpoint_t)kln_func("unregister_wide_hw_breakpoint");
     return fn_find_task_by_vpid ? 0 : -ENOENT;
 }
 
@@ -461,37 +463,64 @@ static void process_command(void)
 }
 
 /* =====================================================================
- * kprobe on __arm64_sys_getpid — 通信触发器
+ * HW 执行断点 on __arm64_sys_ioprio_get — 通信触发器
  *
- * 99.99% 的 getpid 调用: PID 不匹配 → 立刻 return 0
- * 只有 overlay 进程的 getpid 会触发命令处理
+ * 用 HW 断点替代 kprobe 避免与 KernelSU 冲突
+ * 用冷门 syscall (ioprio_get) 避免高频开销
  * ===================================================================== */
 
-static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+static struct perf_event * __percpu *comm_bp;
+
+static void comm_bp_handler(struct perf_event *bp,
+                            struct perf_sample_data *data,
+                            struct pt_regs *regs)
 {
     if (current->tgid != comm_pid)
-        return 0;
+        return;
 
-    /* PID 匹配, 检查共享页是否有待处理命令 */
     if (READ_ONCE(shm->state) != SHM_STATE_PENDING)
-        return 0;
+        return;
 
-    /* MAGIC 验证 */
     if (shm->magic != (uint32_t)(usa_magic & 0xFFFFFFFF))
-        return 0;
+        return;
 
     smp_rmb();
     process_command();
     smp_wmb();
 
     WRITE_ONCE(shm->state, SHM_STATE_DONE);
-    return 0;
 }
 
-static struct kprobe kp_getpid = {
-    .symbol_name = "__arm64_sys_getpid",
-    .pre_handler = kp_pre_handler,
-};
+typedef struct perf_event * __percpu *(*register_wide_hw_breakpoint_t)(
+    struct perf_event_attr *attr,
+    perf_overflow_handler_t triggered,
+    void *context);
+typedef void (*unregister_wide_hw_breakpoint_t)(struct perf_event * __percpu *cpu_events);
+static register_wide_hw_breakpoint_t fn_register_wide_hw_breakpoint;
+static unregister_wide_hw_breakpoint_t fn_unregister_wide_hw_breakpoint;
+
+static int register_comm_bp(void)
+{
+    struct perf_event_attr attr;
+    unsigned long addr;
+
+    if (!fn_register_wide_hw_breakpoint || !kln_func) return -ENOSYS;
+
+    addr = kln_func("__arm64_sys_ioprio_get");
+    if (!addr) return -ENOENT;
+
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = addr;
+    attr.bp_len = HW_BREAKPOINT_LEN_4;
+    attr.bp_type = HW_BREAKPOINT_X;
+
+    comm_bp = fn_register_wide_hw_breakpoint(&attr, comm_bp_handler, NULL);
+    if (IS_ERR(comm_bp)) {
+        comm_bp = NULL;
+        return PTR_ERR(comm_bp);
+    }
+    return 0;
+}
 
 /* =====================================================================
  * 隐藏
@@ -499,14 +528,6 @@ static struct kprobe kp_getpid = {
 
 static struct list_head *saved_prev;
 static int hidden;
-
-static void hide_kprobe_from_list(struct kprobe *kp)
-{
-    if (kp->hlist.pprev) {
-        hlist_del_rcu(&kp->hlist);
-        kp->hlist.pprev = NULL;
-    }
-}
 
 static void __maybe_unused hide_module(void)
 {
@@ -548,16 +569,14 @@ static int __init driver_entry(void)
         return -ENOMEM;
     }
 
-    /* kprobe on getpid */
-    ret = register_kprobe(&kp_getpid);
+    /* HW 执行断点 on __arm64_sys_ioprio_get */
+    ret = register_comm_bp();
     if (ret < 0) {
+        pr_info("usa_hook: register_comm_bp failed %d\n", ret);
         proc_remove(usa_proc_entry);
         __free_page(shm_page);
         return ret;
     }
-
-    /* 隐藏 kprobe */
-    hide_kprobe_from_list(&kp_getpid);
 
     memset(&shoot_state, 0, sizeof(shoot_state));
     return 0;
@@ -571,7 +590,10 @@ static void __exit driver_unload(void)
         shoot_state.bp_event = NULL;
     }
 
-    unregister_kprobe(&kp_getpid);
+    if (comm_bp && fn_unregister_wide_hw_breakpoint) {
+        fn_unregister_wide_hw_breakpoint(comm_bp);
+        comm_bp = NULL;
+    }
     if (usa_proc_entry) proc_remove(usa_proc_entry);
     unhide_module();
     if (shm_page) __free_page(shm_page);
