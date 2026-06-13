@@ -16,6 +16,8 @@
 #include <linux/sched/task.h>
 #include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
+#include <uapi/asm-generic/mman-common.h>
 #include <linux/highmem.h>
 #include <linux/pid.h>
 #include <linux/proc_fs.h>
