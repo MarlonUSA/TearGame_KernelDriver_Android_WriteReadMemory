@@ -344,7 +344,7 @@ static int usa_shoot_inject(int target_pid, const char *so_path, unsigned long d
     attr.bp_len = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
 
-    bp = register_perf_hw_breakpoint(&attr, shoot_bp_handler, NULL, task);
+    bp = register_user_hw_breakpoint(&attr, shoot_bp_handler, NULL, task);
     if (IS_ERR(bp)) {
         /* 回退: 不用 HW BP, 直接用 UXN + 修改 thread PC */
         /* 简化方案: 直接找一个睡眠线程改它的 PC */
