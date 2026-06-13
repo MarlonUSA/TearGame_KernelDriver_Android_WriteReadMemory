@@ -1,23 +1,24 @@
 /**
- * usa_client.h — kprobe getpid 触发 + 共享页通信
+ * usa_client.h v15 — SKJH 通信协议
  *
  * 流程:
- *   usa_shm_init()      → mmap /proc/gki_tracing 获取共享页
- *   写命令到共享页
- *   getpid()            → 触发 kprobe → 内核处理命令
- *   读结果从共享页
+ *   1. overlay 启动, malloc 4KB 对齐缓冲, mlock 锁定
+ *   2. overlay exec loader.sh, 传 comm_pid + comm_addr 给 insmod
+ *   3. overlay 写命令到缓冲, 调 getpid() 触发 kprobe
+ *   4. 内核 kprobe handler 直接读 overlay 用户内存, 处理, 写回
+ *   5. overlay 读结果
  */
 
 #ifndef USA_CLIENT_H
 #define USA_CLIENT_H
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <pthread.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
@@ -28,12 +29,11 @@
 #define OP_INJECT_SO    0x820
 #define OP_HIDE_MAPS    0x830
 
-/* 共享页状态 */
+/* 共享缓冲状态 */
 #define SHM_STATE_IDLE    0
 #define SHM_STATE_PENDING 1
 #define SHM_STATE_DONE    2
 
-/* 共享页布局 (和 entry.c 一致) */
 struct usa_shm {
     volatile uint32_t state;
     uint32_t magic;
@@ -47,45 +47,49 @@ struct usa_shm {
 };
 
 static struct usa_shm *_usa_shm = NULL;
-static uint32_t _usa_magic = 0;
+static uint32_t _usa_magic = 0x55aabbcc;
 static pthread_mutex_t _usa_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-#define USA_MAGIC_PATH "/data/local/tmp/.gs_m"
-#define USA_PROC_PATH  "/proc/gki_tracing"
+/* ====== 初始化: 分配 + mlock + 加载驱动 ====== */
 
-/* ====== 初始化 ====== */
-
-static inline int usa_shm_init(void)
+/*
+ * 调用方式 (overlay 主进程内):
+ *   usa_shm_setup() 分配 4KB 对齐缓冲, 返回地址
+ *   然后 overlay 用 system() 执行 loader.sh, 传 comm_pid + comm_addr
+ *   loader.sh 做 insmod 加载驱动
+ */
+static inline unsigned long usa_shm_setup(void)
 {
-    int fd;
-    FILE *f;
-    char buf[32] = {0};
-
-    f = fopen(USA_MAGIC_PATH, "r");
-    if (f) {
-        if (fgets(buf, sizeof(buf), f))
-            _usa_magic = (uint32_t)strtoul(buf, NULL, 16);
-        fclose(f);
+    void *buf = NULL;
+    /* 4KB 对齐分配 */
+    if (posix_memalign(&buf, 4096, 4096) != 0) return 0;
+    memset(buf, 0, 4096);
+    /* mlock 防止换出 (内核访问时不 page fault) */
+    if (mlock(buf, 4096) != 0) {
+        /* 不 fatal, 继续 */
     }
+    _usa_shm = (struct usa_shm *)buf;
+    _usa_shm->state = SHM_STATE_IDLE;
+    return (unsigned long)buf;
+}
 
-    fd = open(USA_PROC_PATH, O_RDWR);
-    if (fd < 0) return -1;
-
-    _usa_shm = (struct usa_shm *)mmap(NULL, 4096,
-                                       PROT_READ | PROT_WRITE,
-                                       MAP_SHARED, fd, 0);
-    close(fd);
-
-    if (_usa_shm == MAP_FAILED) {
-        _usa_shm = NULL;
-        return -1;
-    }
-    return 0;
+static inline int usa_load_driver(const char *ko_path)
+{
+    char cmd[512];
+    if (!_usa_shm) return -1;
+    snprintf(cmd, sizeof(cmd),
+             "su -c 'insmod %s comm_pid=%d comm_addr=0x%lx usa_magic=0x%x'",
+             ko_path, getpid(), (unsigned long)_usa_shm, _usa_magic);
+    return system(cmd);
 }
 
 static inline void usa_shm_cleanup(void)
 {
-    if (_usa_shm) { munmap(_usa_shm, 4096); _usa_shm = NULL; }
+    if (_usa_shm) {
+        munlock(_usa_shm, 4096);
+        free(_usa_shm);
+        _usa_shm = NULL;
+    }
 }
 
 /* ====== 发送命令: 写共享页 → getpid() 触发 kprobe → 读结果 ====== */
@@ -96,7 +100,7 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
     int retries;
     int64_t result;
 
-    if (!_usa_shm) return -1;
+    if (!_usa_shm) return -ENODEV;
     pthread_mutex_lock(&_usa_mtx);
 
     _usa_shm->magic  = _usa_magic;
@@ -107,10 +111,10 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
     _usa_shm->result = 0;
     __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
 
-    /* getpid() 触发 kprobe → 内核在 pre_handler 里处理命令 */
-    syscall(__NR_ioprio_get, 0, 0);
+    /* 触发 kprobe: getpid 进入内核, 我们的 handler 读 comm_addr */
+    syscall(__NR_getpid);
 
-    /* kprobe pre_handler 同步执行完毕, 检查结果 */
+    /* kprobe 同步执行完, 检查结果 */
     if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
         result = _usa_shm->result;
         __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
@@ -118,9 +122,9 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
         return result;
     }
 
-    /* 备用: 等几次 (不应该到这里, pre_handler 是同步的) */
+    /* 备用重试 (不应该到这) */
     for (retries = 0; retries < 100; retries++) {
-        syscall(__NR_ioprio_get, 0, 0);
+        syscall(__NR_getpid);
         if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
             result = _usa_shm->result;
             __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
@@ -132,7 +136,7 @@ static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
 
     __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&_usa_mtx);
-    return -1;
+    return -ETIMEDOUT;
 }
 
 /* ====== 内存读写 ====== */
@@ -163,48 +167,25 @@ static inline unsigned long usa_get_module_base(int pid, const char *name)
     return (ret > 0) ? (unsigned long)ret : 0;
 }
 
-/* ====== 检测驱动 ====== */
-
 static inline int usa_driver_loaded(void)
 {
-    return (_usa_shm != NULL) || (access(USA_PROC_PATH, F_OK) == 0);
+    /* 简单方式: 试调用一个无害命令, 看 result 是否变化 */
+    if (!_usa_shm) return 0;
+    int64_t ret = usa_send_cmd(OP_MODULE_BASE, getpid(), 0, 0);
+    return (ret != -ENODEV && ret != -ETIMEDOUT);
 }
 
-/* ====== SO 注入 (传入 dlopen 地址, 由 overlay 计算) ====== */
+/* ====== SO 注入 (异步, Shoot 系统) ====== */
 
 static inline int usa_inject_so(int pid, const char *path, unsigned long dlopen_addr)
 {
-    if (!_usa_shm) return -999;
+    if (!_usa_shm) return -ENODEV;
     pthread_mutex_lock(&_usa_mtx);
-
-    __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
     memset(_usa_shm->name, 0, sizeof(_usa_shm->name));
     strncpy(_usa_shm->name, path, sizeof(_usa_shm->name) - 1);
-    _usa_shm->magic  = _usa_magic;
-    _usa_shm->cmd    = OP_INJECT_SO;
-    _usa_shm->pid    = pid;
-    _usa_shm->addr   = dlopen_addr;
-    _usa_shm->size   = 0;
-    _usa_shm->result = 0;
-    __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
-
-    /* 触发 kprobe */
-    syscall(__NR_ioprio_get, 0, 0);
-
-    /* Shoot 注入是异步的 (等游戏线程触发 UXN 陷阱)
-     * 但 vm_mmap + shellcode 写入是同步的 */
-    int retries;
-    for (retries = 0; retries < 1000; retries++) {
-        if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE)
-            break;
-        syscall(__NR_ioprio_get, 0, 0);
-        usleep(100);
-    }
-
-    int64_t result = _usa_shm->result;
-    __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&_usa_mtx);
-    return (int)result;
+    /* 返回 -EAGAIN 表示已派发到 workqueue, 用户态需轮询完成状态 */
+    return (int)usa_send_cmd(OP_INJECT_SO, pid, dlopen_addr, 0);
 }
 
 /* ====== Maps 隐藏 ====== */
