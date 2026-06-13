@@ -411,7 +411,11 @@ static void process_command(struct usa_shm *shm)
  * current == overlay 的线程 (HW BP scoped to comm_pid task)
  * ===================================================================== */
 
-static struct perf_event *comm_bp;
+/* 给 overlay 所有线程都注册 BP (SKJH add_comm_thread_breakpoint)
+ * register_user_hw_breakpoint 是 per-thread, 必须遍历 thread_group */
+#define MAX_COMM_BPS 64
+static struct perf_event *comm_bps[MAX_COMM_BPS];
+static int comm_bp_count;
 
 static void comm_bp_handler(struct perf_event *bp,
                             struct perf_sample_data *data,
@@ -438,9 +442,10 @@ static void comm_bp_handler(struct perf_event *bp,
 
 static int register_comm_watchpoint(void)
 {
-    struct task_struct *task;
+    struct task_struct *leader, *t;
     struct perf_event_attr attr;
     struct perf_event *bp;
+    int registered = 0;
 
     if (comm_pid < 0 || !comm_addr) {
         pr_info("usa_hook: invalid comm_pid=%d or comm_addr=0x%lx\n",
@@ -449,29 +454,43 @@ static int register_comm_watchpoint(void)
     }
 
     rcu_read_lock();
-    task = fn_find_task_by_vpid(comm_pid);
-    if (task) get_task_struct(task);
+    leader = fn_find_task_by_vpid(comm_pid);
+    if (leader) get_task_struct(leader);
     rcu_read_unlock();
-    if (!task) {
+    if (!leader) {
         pr_info("usa_hook: overlay task pid=%d not found\n", comm_pid);
         return -ESRCH;
     }
 
     hw_breakpoint_init(&attr);
-    attr.bp_addr = comm_addr;            /* overlay 用户内存地址 */
-    attr.bp_len  = HW_BREAKPOINT_LEN_4;  /* 监视 4 字节 (state 字段) */
-    attr.bp_type = HW_BREAKPOINT_W;      /* 写触发 */
+    attr.bp_addr = comm_addr;
+    attr.bp_len  = HW_BREAKPOINT_LEN_4;
+    attr.bp_type = HW_BREAKPOINT_W;
 
-    bp = fn_register_user_hw_breakpoint(&attr, comm_bp_handler, NULL, task);
-    put_task_struct(task);
+    /* 遍历 thread_group 给所有线程注册 BP */
+    rcu_read_lock();
+    for_each_thread(leader, t) {
+        if (registered >= MAX_COMM_BPS) break;
+        get_task_struct(t);
+        rcu_read_unlock();
 
-    if (IS_ERR(bp)) {
-        pr_info("usa_hook: register HW watchpoint failed %ld\n", PTR_ERR(bp));
-        return (int)PTR_ERR(bp);
+        bp = fn_register_user_hw_breakpoint(&attr, comm_bp_handler, NULL, t);
+        if (!IS_ERR(bp)) {
+            comm_bps[registered++] = bp;
+        } else {
+            pr_info("usa_hook: BP failed for tid=%d err=%ld\n", t->pid, PTR_ERR(bp));
+        }
+
+        put_task_struct(t);
+        rcu_read_lock();
     }
+    rcu_read_unlock();
+    put_task_struct(leader);
 
-    comm_bp = bp;
-    return 0;
+    comm_bp_count = registered;
+    pr_info("usa_hook: registered %d comm BPs for pid=%d addr=0x%lx\n",
+            registered, comm_pid, comm_addr);
+    return registered > 0 ? 0 : -EAGAIN;
 }
 
 /* =====================================================================
@@ -552,10 +571,15 @@ static void __exit driver_unload(void)
         }
     }
 
-    /* 注销通信 HW BP */
-    if (comm_bp && fn_unregister_hw_breakpoint) {
-        fn_unregister_hw_breakpoint(comm_bp);
-        comm_bp = NULL;
+    /* 注销所有线程的通信 HW BP */
+    if (fn_unregister_hw_breakpoint) {
+        for (i = 0; i < comm_bp_count; i++) {
+            if (comm_bps[i]) {
+                fn_unregister_hw_breakpoint(comm_bps[i]);
+                comm_bps[i] = NULL;
+            }
+        }
+        comm_bp_count = 0;
     }
 
     unhide_module();

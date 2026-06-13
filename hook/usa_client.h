@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 
 /* 操作码 */
 #define OP_READ_MEM     0x801
@@ -61,13 +62,31 @@ static pthread_mutex_t _usa_mtx = PTHREAD_MUTEX_INITIALIZER;
 static inline unsigned long usa_shm_setup(void)
 {
     void *buf = NULL;
+    struct rlimit rl;
+
+    /* 提高 mlock 限制 (Android 默认 64KB) */
+    rl.rlim_cur = RLIM_INFINITY;
+    rl.rlim_max = RLIM_INFINITY;
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+
     /* 4KB 对齐分配 */
-    if (posix_memalign(&buf, 4096, 4096) != 0) return 0;
-    memset(buf, 0, 4096);
-    /* mlock 防止换出 (内核访问时不 page fault) */
-    if (mlock(buf, 4096) != 0) {
-        /* 不 fatal, 继续 */
+    if (posix_memalign(&buf, 4096, 4096) != 0) {
+        fprintf(stderr, "usa_shm_setup: posix_memalign failed\n");
+        return 0;
     }
+    memset(buf, 0, 4096);
+
+    /* mlock 必须成功, 否则 page 可能被换出导致内核 handler page fault → panic */
+    if (mlock(buf, 4096) != 0) {
+        fprintf(stderr, "usa_shm_setup: mlock failed: %s (errno=%d)\n",
+                strerror(errno), errno);
+        free(buf);
+        return 0;
+    }
+
+    /* 触摸一次确保页 fault-in */
+    memset(buf, 0, 4096);
+
     _usa_shm = (struct usa_shm *)buf;
     _usa_shm->state = SHM_STATE_IDLE;
     return (unsigned long)buf;
