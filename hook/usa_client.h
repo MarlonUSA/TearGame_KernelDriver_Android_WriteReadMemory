@@ -19,9 +19,15 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
+
+#define USA_IOC_MAGIC 'U'
+#define USA_IOC_REGISTER_COMM _IOW(USA_IOC_MAGIC, 1, unsigned long)
+#define USA_IOC_SEND_CMD      _IOWR(USA_IOC_MAGIC, 2, unsigned long)
 
 /* 操作码 */
 #define OP_READ_MEM     0x801
@@ -47,9 +53,21 @@ struct usa_shm {
     uint8_t  data[3800];
 };
 
-static struct usa_shm *_usa_shm = NULL;
-static uint32_t _usa_magic = 0x55aabbcc;
-static pthread_mutex_t _usa_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* 跨翻译单元共享: 必须只在一个 .o (定义 USA_CLIENT_DEFINE 的 TU, 如 main.cpp) 实例化
+ * 其他 TU 仅 extern 引用同一份, 否则 main.cpp 设置的 _usa_shm 在别处仍是 NULL */
+#ifdef USA_CLIENT_DEFINE
+struct usa_shm *_usa_shm = NULL;
+uint32_t _usa_magic = 0x55aabbcc;
+pthread_mutex_t _usa_mtx = PTHREAD_MUTEX_INITIALIZER;
+pid_t _usa_comm_tid = 0;
+#else
+extern struct usa_shm *_usa_shm;
+extern uint32_t _usa_magic;
+extern pthread_mutex_t _usa_mtx;
+extern pid_t _usa_comm_tid;
+#endif
+/* TLS: 每线程一份, 各 TU 引用同一 TLS slot (链接器去重) */
+static __thread int _usa_fd = -1;
 
 /* ====== 初始化: 分配 + mlock + 加载驱动 ====== */
 
@@ -61,31 +79,31 @@ static pthread_mutex_t _usa_mtx = PTHREAD_MUTEX_INITIALIZER;
  */
 static inline unsigned long usa_shm_setup(void)
 {
-    void *buf = NULL;
+    void *buf;
     struct rlimit rl;
 
-    /* 提高 mlock 限制 (Android 默认 64KB) */
     rl.rlim_cur = RLIM_INFINITY;
     rl.rlim_max = RLIM_INFINITY;
     setrlimit(RLIMIT_MEMLOCK, &rl);
 
-    /* 4KB 对齐分配 */
-    if (posix_memalign(&buf, 4096, 4096) != 0) {
-        fprintf(stderr, "usa_shm_setup: posix_memalign failed\n");
+    /* 用 mmap 而不是 posix_memalign:
+     * scudo allocator 返回的内存 VMA flags 可能让 kernel HW BP 拒绝
+     * mmap MAP_PRIVATE|MAP_ANONYMOUS 是干净独立的 VMA */
+    buf = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        fprintf(stderr, "usa_shm_setup: mmap failed: %s\n", strerror(errno));
         return 0;
     }
-    memset(buf, 0, 4096);
 
-    /* mlock 必须成功, 否则 page 可能被换出导致内核 handler page fault → panic */
     if (mlock(buf, 4096) != 0) {
-        fprintf(stderr, "usa_shm_setup: mlock failed: %s (errno=%d)\n",
+        fprintf(stderr, "usa_shm_setup: mlock failed: %s (errno=%d) — 继续但 handler 可能 page fault\n",
                 strerror(errno), errno);
-        free(buf);
-        return 0;
     }
 
-    /* 触摸一次确保页 fault-in */
+    /* fault-in: 触摸所有字节 */
     memset(buf, 0, 4096);
+    *(volatile uint32_t *)buf = 0;  /* 确保第一个 word 已分配 */
 
     _usa_shm = (struct usa_shm *)buf;
     _usa_shm->state = SHM_STATE_IDLE;
@@ -97,9 +115,24 @@ static inline int usa_load_driver(const char *ko_path)
     char cmd[512];
     if (!_usa_shm) return -1;
     snprintf(cmd, sizeof(cmd),
-             "su -c 'insmod %s comm_pid=%d comm_addr=0x%lx usa_magic=0x%x'",
-             ko_path, getpid(), (unsigned long)_usa_shm, _usa_magic);
+             "su -c 'insmod %s usa_magic=0x%x'",
+             ko_path, _usa_magic);
     return system(cmd);
+}
+
+/* 注册 BP 给当前线程 (rwProcMem33 next-instruction 方案已修死循环 bug).
+ * 仍保留 ioctl SEND_CMD 作 fallback / explicit 同步路径. */
+static inline int usa_register_thread(void)
+{
+    int fd, ret;
+    unsigned long addr;
+    if (!_usa_shm) return -1;
+    addr = (unsigned long)_usa_shm;
+    fd = open("/proc/usa_hook", O_RDWR);
+    if (fd < 0) return -1;
+    ret = ioctl(fd, USA_IOC_REGISTER_COMM, &addr);
+    close(fd);
+    return ret;
 }
 
 static inline void usa_shm_cleanup(void)
@@ -116,49 +149,40 @@ static inline void usa_shm_cleanup(void)
 static inline int64_t usa_send_cmd(uint32_t cmd, int32_t pid,
                                     uint64_t addr, uint64_t size)
 {
-    int retries;
     int64_t result;
+    unsigned long shm_addr;
 
     if (!_usa_shm) return -ENODEV;
+
+    /* 每线程打开自己的 fd (TLS) */
+    if (_usa_fd < 0) {
+        _usa_fd = open("/proc/usa_hook", O_RDWR);
+        if (_usa_fd < 0) return -ENODEV;
+    }
+
     pthread_mutex_lock(&_usa_mtx);
 
-    /* 先写所有字段 (这些写入不在 watchpoint 监视范围内) */
     _usa_shm->magic  = _usa_magic;
     _usa_shm->cmd    = cmd;
     _usa_shm->pid    = pid;
     _usa_shm->addr   = addr;
     _usa_shm->size   = size;
     _usa_shm->result = 0;
+    /* 注意: 故意不写 state = SHM_STATE_PENDING.
+     * 那条 STR 会触发 HW Watchpoint, 而 ARM64 kernel 6.12 对 custom overflow handler
+     * 不做 single-step (mainline 6.13+ 才修), 导致 STR 死循环.
+     * 通信走纯 ioctl 同步处理, 不依赖 BP fire. */
 
-    /* 最后写 state = PENDING
-     * 这一行写入触发 HW Write Watchpoint
-     * → 内核 comm_bp_handler 立刻执行 (在 overlay 线程上下文)
-     * → 处理完毕, 写 state = DONE
-     * → 这次写返回时, state 已经是 DONE */
-    __atomic_store_n(&_usa_shm->state, SHM_STATE_PENDING, __ATOMIC_RELEASE);
-
-    /* HW watchpoint handler 同步执行完了, 检查结果 */
-    if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
-        result = _usa_shm->result;
-        __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+    shm_addr = (unsigned long)_usa_shm;
+    if (ioctl(_usa_fd, USA_IOC_SEND_CMD, &shm_addr) < 0) {
         pthread_mutex_unlock(&_usa_mtx);
-        return result;
+        return -errno;
     }
 
-    /* 备用轮询 (handler 应该是同步的, 这里几乎用不到) */
-    for (retries = 0; retries < 1000; retries++) {
-        if (__atomic_load_n(&_usa_shm->state, __ATOMIC_ACQUIRE) == SHM_STATE_DONE) {
-            result = _usa_shm->result;
-            __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
-            pthread_mutex_unlock(&_usa_mtx);
-            return result;
-        }
-        usleep(10);
-    }
-
-    __atomic_store_n(&_usa_shm->state, SHM_STATE_IDLE, __ATOMIC_RELEASE);
+    result = _usa_shm->result;
+    _usa_shm->state = SHM_STATE_IDLE;
     pthread_mutex_unlock(&_usa_mtx);
-    return -ETIMEDOUT;
+    return result;
 }
 
 /* ====== 内存读写 ====== */
@@ -191,10 +215,11 @@ static inline unsigned long usa_get_module_base(int pid, const char *name)
 
 static inline int usa_driver_loaded(void)
 {
-    /* 简单方式: 试调用一个无害命令, 看 result 是否变化 */
+    /* 驱动加载会创建 /proc/usa_hook 节点, 直接 access 检查
+     * 不调 usa_send_cmd 避免依赖 BP / ioctl 副作用 */
     if (!_usa_shm) return 0;
-    int64_t ret = usa_send_cmd(OP_MODULE_BASE, getpid(), 0, 0);
-    return (ret != -ENODEV && ret != -ETIMEDOUT);
+    if (access("/proc/usa_hook", F_OK) != 0) return 0;
+    return 1;
 }
 
 /* ====== SO 注入 (异步, Shoot 系统) ====== */

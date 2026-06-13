@@ -22,6 +22,8 @@
 #include <linux/kernel.h>
 
 uintptr_t get_module_base(pid_t pid, char *name);
+/* 找模块的第一个可执行 (r-xp) 段起始地址 — Shoot 注入需要 trap 真代码 */
+uintptr_t get_module_code_seg(pid_t pid, char *name);
 //原作者JiangNight  源码存在严重问题 加载格机 重启  黑砖    加载失败  kernel pacni 各种问题
 //泪心已经彻底修复优化
 	//printk(KERN_INFO "[TearGame] QQ: 2254013571\n");
