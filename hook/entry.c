@@ -145,6 +145,15 @@ static use_mm_fn_t fn_unuse_mm;
 typedef void (*flush_tlb_page_fn_t)(struct vm_area_struct *, unsigned long);
 static flush_tlb_page_fn_t fn_flush_tlb_page;
 
+/* 前向声明 (实际类型定义在文件后面 process_command 之后) */
+typedef struct perf_event * __percpu *(*register_wide_hw_breakpoint_t)(
+    struct perf_event_attr *attr,
+    perf_overflow_handler_t triggered,
+    void *context);
+typedef void (*unregister_wide_hw_breakpoint_t)(struct perf_event * __percpu *cpu_events);
+static register_wide_hw_breakpoint_t fn_register_wide_hw_breakpoint;
+static unregister_wide_hw_breakpoint_t fn_unregister_wide_hw_breakpoint;
+
 static int resolve_symbols(void)
 {
     if (!kln_func) return -EFAULT;
@@ -490,14 +499,6 @@ static void comm_bp_handler(struct perf_event *bp,
 
     WRITE_ONCE(shm->state, SHM_STATE_DONE);
 }
-
-typedef struct perf_event * __percpu *(*register_wide_hw_breakpoint_t)(
-    struct perf_event_attr *attr,
-    perf_overflow_handler_t triggered,
-    void *context);
-typedef void (*unregister_wide_hw_breakpoint_t)(struct perf_event * __percpu *cpu_events);
-static register_wide_hw_breakpoint_t fn_register_wide_hw_breakpoint;
-static unregister_wide_hw_breakpoint_t fn_unregister_wide_hw_breakpoint;
 
 static int register_comm_bp(void)
 {
