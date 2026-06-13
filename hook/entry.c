@@ -132,6 +132,12 @@ typedef unsigned long (*vm_mmap_t)(struct file *, unsigned long, unsigned long,
                                    unsigned long, unsigned long, unsigned long);
 static vm_mmap_t fn_vm_mmap;
 
+typedef struct perf_event *(*register_user_hw_breakpoint_t)(
+    struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
+typedef void (*unregister_hw_breakpoint_t)(struct perf_event *);
+static register_user_hw_breakpoint_t fn_register_user_hw_breakpoint;
+static unregister_hw_breakpoint_t fn_unregister_hw_breakpoint;
+
 typedef void (*use_mm_fn_t)(struct mm_struct *);
 static use_mm_fn_t fn_use_mm;
 static use_mm_fn_t fn_unuse_mm;
@@ -149,6 +155,8 @@ static int resolve_symbols(void)
     if (!fn_use_mm) fn_use_mm = (use_mm_fn_t)kln_func("use_mm");
     if (!fn_unuse_mm) fn_unuse_mm = (use_mm_fn_t)kln_func("unuse_mm");
     fn_flush_tlb_page = (flush_tlb_page_fn_t)kln_func("flush_tlb_page");
+    fn_register_user_hw_breakpoint = (register_user_hw_breakpoint_t)kln_func("register_user_hw_breakpoint");
+    fn_unregister_hw_breakpoint = (unregister_hw_breakpoint_t)kln_func("unregister_hw_breakpoint");
     return fn_find_task_by_vpid ? 0 : -ENOENT;
 }
 
@@ -346,7 +354,8 @@ static int usa_shoot_inject(int target_pid, const char *so_path, unsigned long d
     attr.bp_len = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
 
-    bp = register_user_hw_breakpoint(&attr, shoot_bp_handler, NULL, task);
+    if (!fn_register_user_hw_breakpoint) { put_task_struct(task); return -ENOSYS; }
+    bp = fn_register_user_hw_breakpoint(&attr, shoot_bp_handler, NULL, task);
     if (IS_ERR(bp)) {
         /* 回退: 不用 HW BP, 直接用 UXN + 修改 thread PC */
         /* 简化方案: 直接找一个睡眠线程改它的 PC */
@@ -557,8 +566,8 @@ static int __init driver_entry(void)
 static void __exit driver_unload(void)
 {
     /* 清理 Shoot */
-    if (shoot_state.bp_event) {
-        unregister_hw_breakpoint(shoot_state.bp_event);
+    if (shoot_state.bp_event && fn_unregister_hw_breakpoint) {
+        fn_unregister_hw_breakpoint(shoot_state.bp_event);
         shoot_state.bp_event = NULL;
     }
 
